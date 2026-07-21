@@ -1,0 +1,54 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cross-platform:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install lightweight test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Clean import checks
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform
+          import donna.tools.setup_startup as startup
+          import donna.tools.audio_switcher as audio
+
+          print("system=", platform.system())
+          assert callable(startup.enable_startup)
+          assert callable(startup.disable_startup)
+          assert callable(startup.startup_status)
+          assert hasattr(audio, "toggle_audio_endpoint")
+          # Import must never raise; non-Windows tools should refuse cleanly.
+          if platform.system() != "Windows":
+              msg = audio.toggle_audio_endpoint("wired")
+              assert "Windows-only" in msg, msg
+          print("import_ok")
+          PY
+
+      - name: Startup registration unit tests
+        run: pytest tests/test_startup_tray.py -q --tb=short -k "not tray_icon"

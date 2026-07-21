@@ -1,38 +1,61 @@
-"""Toggle Windows default audio endpoint between wired and Bluetooth devices."""
+"""Toggle Windows default audio endpoint between wired and Bluetooth devices.
+
+Windows-only: ``pycaw`` / ``comtypes`` are imported lazily so macOS and Linux
+can import this module without failing at process start.
+"""
 
 from __future__ import annotations
 
-from ctypes import HRESULT, c_int, c_wchar_p
+import platform
 from typing import Any
 
-from comtypes import CLSCTX_ALL, COMMETHOD, CoCreateInstance, GUID, IUnknown
+_WINDOWS = platform.system() == "Windows"
 
+# Populated only on Windows when comtypes is available.
+CLSCTX_ALL: Any = None
+CoCreateInstance: Any = None
+IPolicyConfig: Any = None
+_CLSID_POLICY_CONFIG: Any = None
+_COMTYPES_READY = False
 
-# Undocumented PolicyConfig COM interface used to set the default endpoint.
-class IPolicyConfig(IUnknown):
-    _iid_ = GUID("{f8679f50-850a-41cf-9c72-430f290290c8}")
-    _methods_ = (
-        COMMETHOD([], HRESULT, "Unused1"),
-        COMMETHOD([], HRESULT, "Unused2"),
-        COMMETHOD([], HRESULT, "Unused3"),
-        COMMETHOD([], HRESULT, "Unused4"),
-        COMMETHOD([], HRESULT, "Unused5"),
-        COMMETHOD([], HRESULT, "Unused6"),
-        COMMETHOD([], HRESULT, "Unused7"),
-        COMMETHOD([], HRESULT, "Unused8"),
-        COMMETHOD([], HRESULT, "Unused9"),
-        COMMETHOD([], HRESULT, "Unused10"),
-        COMMETHOD(
-            [],
-            HRESULT,
-            "SetDefaultEndpoint",
-            (["in"], c_wchar_p, "deviceId"),
-            (["in"], c_int, "role"),
-        ),
-    )
+if _WINDOWS:
+    try:
+        from ctypes import HRESULT, c_int, c_wchar_p
 
+        from comtypes import CLSCTX_ALL as _CLSCTX_ALL
+        from comtypes import COMMETHOD, CoCreateInstance as _CoCreateInstance
+        from comtypes import GUID, IUnknown
 
-_CLSID_POLICY_CONFIG = GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}")
+        class _IPolicyConfig(IUnknown):
+            _iid_ = GUID("{f8679f50-850a-41cf-9c72-430f290290c8}")
+            _methods_ = (
+                COMMETHOD([], HRESULT, "Unused1"),
+                COMMETHOD([], HRESULT, "Unused2"),
+                COMMETHOD([], HRESULT, "Unused3"),
+                COMMETHOD([], HRESULT, "Unused4"),
+                COMMETHOD([], HRESULT, "Unused5"),
+                COMMETHOD([], HRESULT, "Unused6"),
+                COMMETHOD([], HRESULT, "Unused7"),
+                COMMETHOD([], HRESULT, "Unused8"),
+                COMMETHOD([], HRESULT, "Unused9"),
+                COMMETHOD([], HRESULT, "Unused10"),
+                COMMETHOD(
+                    [],
+                    HRESULT,
+                    "SetDefaultEndpoint",
+                    (["in"], c_wchar_p, "deviceId"),
+                    (["in"], c_int, "role"),
+                ),
+            )
+
+        CLSCTX_ALL = _CLSCTX_ALL
+        CoCreateInstance = _CoCreateInstance
+        IPolicyConfig = _IPolicyConfig
+        _CLSID_POLICY_CONFIG = GUID("{870af99c-171d-4f9e-af0d-e63df40c2bc9}")
+        _COMTYPES_READY = True
+    except ImportError:
+        _COMTYPES_READY = False
+
 
 _BLUETOOTH_HINTS = ("bluetooth", "bt ", "airpods", "headset", "buds")
 _WIRED_HINTS = ("wired", "realtek", "speakers", "headphone", "earphone", "usb audio")
@@ -76,12 +99,19 @@ def toggle_audio_endpoint(target_type: str) -> str:
     Returns:
         Status string for the ReAct observation path.
     """
+    if not _WINDOWS:
+        return "ERROR: toggle_audio_endpoint is Windows-only"
+    if not _COMTYPES_READY or IPolicyConfig is None or CoCreateInstance is None:
+        return "ERROR: comtypes unavailable (Windows audio COM bindings missing)"
+
     kind = str(target_type or "").strip().lower()
     if kind not in ("bluetooth", "wired"):
         return "ERROR: target_type must be 'bluetooth' or 'wired'"
 
     try:
         from pycaw.pycaw import AudioUtilities
+    except ImportError as exc:
+        return f"ERROR: pycaw unavailable ({exc})"
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: pycaw unavailable ({exc})"
 

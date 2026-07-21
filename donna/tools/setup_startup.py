@@ -1,4 +1,8 @@
-"""Register / unregister Donna to start with Windows (HKCU Run).
+"""Cross-platform Donna login/startup registration.
+
+Windows: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run
+macOS:   ~/Library/LaunchAgents/com.donna.agent.plist
+Linux:   ~/.config/autostart/donna.desktop
 
 Usage:
   python -m donna.tools.setup_startup install
@@ -9,12 +13,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import platform
 import sys
-import winreg
 from pathlib import Path
 
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "DonnaAssistant"
+MACOS_LABEL = "com.donna.agent"
+MACOS_PLIST_NAME = f"{MACOS_LABEL}.plist"
+LINUX_DESKTOP_NAME = "donna.desktop"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def project_root() -> Path:
@@ -23,28 +30,42 @@ def project_root() -> Path:
     return PROJECT_ROOT
 
 
-def bat_path() -> Path:
-    return project_root() / "start_donna.bat"
+def _system() -> str:
+    return platform.system()
 
 
 def python_launcher() -> Path:
-    """Prefer pythonw.exe so startup is windowless; fall back to python.exe."""
-    venv = project_root() / ".venv" / "Scripts"
-    for name in ("pythonw.exe", "python.exe"):
-        candidate = venv / name
-        if candidate.is_file():
-            return candidate
+    """Prefer a windowless / venv interpreter when present."""
+    root = project_root()
+    system = _system()
+    if system == "Windows":
+        venv = root / ".venv" / "Scripts"
+        for name in ("pythonw.exe", "python.exe"):
+            candidate = venv / name
+            if candidate.is_file():
+                return candidate
+    else:
+        venv_bin = root / ".venv" / "bin"
+        for name in ("python3", "python"):
+            candidate = venv_bin / name
+            if candidate.is_file():
+                return candidate
     return Path(sys.executable)
+
+
+def entry_script() -> Path:
+    return project_root() / "run.py"
+
+
+def bat_path() -> Path:
+    return project_root() / "start_donna.bat"
 
 
 def write_start_bat() -> Path:
     """Create ``start_donna.bat`` that launches ``run.py`` from the project venv."""
     root = project_root()
     py = python_launcher()
-    entry = root / "run.py"
-    # /d so `cd` works across drives; quoted paths for spaces.
-    # Always use run.py (never `python donna/core_agent.py`) so sys.path is the
-    # repo root and ``import donna`` / root modules keep working.
+    entry = entry_script()
     lines = [
         "@echo off",
         f'cd /d "{root}"',
@@ -56,7 +77,68 @@ def write_start_bat() -> Path:
     return path
 
 
-def install() -> int:
+def macos_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / MACOS_PLIST_NAME
+
+
+def linux_desktop_path() -> Path:
+    return Path.home() / ".config" / "autostart" / LINUX_DESKTOP_NAME
+
+
+def _write_macos_plist() -> Path:
+    root = project_root()
+    py = python_launcher()
+    entry = entry_script()
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>{MACOS_LABEL}</string>
+\t<key>ProgramArguments</key>
+\t<array>
+\t\t<string>{py}</string>
+\t\t<string>{entry}</string>
+\t</array>
+\t<key>WorkingDirectory</key>
+\t<string>{root}</string>
+\t<key>RunAtLoad</key>
+\t<true/>
+\t<key>KeepAlive</key>
+\t<false/>
+</dict>
+</plist>
+"""
+    path = macos_plist_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plist, encoding="utf-8")
+    return path
+
+
+def _write_linux_desktop() -> Path:
+    root = project_root()
+    py = python_launcher()
+    entry = entry_script()
+    body = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Version=1.0\n"
+        "Name=Donna\n"
+        "Comment=Donna local-first voice agent\n"
+        f'Exec="{py}" "{entry}"\n'
+        f"Path={root}\n"
+        "Terminal=false\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+    path = linux_desktop_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _enable_windows() -> int:
+    import winreg
+
     bat = write_start_bat()
     command = f'"{bat}"'
     with winreg.OpenKey(
@@ -69,7 +151,9 @@ def install() -> int:
     return 0
 
 
-def uninstall() -> int:
+def _disable_windows() -> int:
+    import winreg
+
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE
@@ -82,7 +166,9 @@ def uninstall() -> int:
         return 0
 
 
-def status() -> int:
+def _status_windows() -> int:
+    import winreg
+
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ
@@ -95,21 +181,127 @@ def status() -> int:
         return 1
 
 
+def _enable_macos() -> int:
+    path = _write_macos_plist()
+    print(f"[OK] Startup enabled: {path}")
+    print(f"     Label: {MACOS_LABEL}")
+    return 0
+
+
+def _disable_macos() -> int:
+    path = macos_plist_path()
+    if path.is_file():
+        path.unlink()
+        print(f"[OK] Startup removed: {path}")
+    else:
+        print(f"[OK] Startup entry already absent: {path}")
+    return 0
+
+
+def _status_macos() -> int:
+    path = macos_plist_path()
+    if path.is_file():
+        print(f"[ON] {path}")
+        return 0
+    print(f"[OFF] {path} is not present")
+    return 1
+
+
+def _enable_linux() -> int:
+    path = _write_linux_desktop()
+    print(f"[OK] Startup enabled: {path}")
+    return 0
+
+
+def _disable_linux() -> int:
+    path = linux_desktop_path()
+    if path.is_file():
+        path.unlink()
+        print(f"[OK] Startup removed: {path}")
+    else:
+        print(f"[OK] Startup entry already absent: {path}")
+    return 0
+
+
+def _status_linux() -> int:
+    path = linux_desktop_path()
+    if path.is_file():
+        print(f"[ON] {path}")
+        return 0
+    print(f"[OFF] {path} is not present")
+    return 1
+
+
+def enable_startup() -> int:
+    """Register Donna to launch at user login on the current OS."""
+    system = _system()
+    if system == "Windows":
+        return _enable_windows()
+    if system == "Darwin":
+        return _enable_macos()
+    if system == "Linux":
+        return _enable_linux()
+    print(f"[ERROR] Unsupported platform for startup registration: {system}", file=sys.stderr)
+    return 2
+
+
+def disable_startup() -> int:
+    """Remove Donna from login/startup on the current OS."""
+    system = _system()
+    if system == "Windows":
+        return _disable_windows()
+    if system == "Darwin":
+        return _disable_macos()
+    if system == "Linux":
+        return _disable_linux()
+    print(f"[ERROR] Unsupported platform for startup registration: {system}", file=sys.stderr)
+    return 2
+
+
+def startup_status() -> int:
+    """Print whether Donna is registered for login/startup (0=on, 1=off)."""
+    system = _system()
+    if system == "Windows":
+        return _status_windows()
+    if system == "Darwin":
+        return _status_macos()
+    if system == "Linux":
+        return _status_linux()
+    print(f"[ERROR] Unsupported platform for startup registration: {system}", file=sys.stderr)
+    return 2
+
+
+# CLI aliases (kept for existing docs / scripts).
+def install() -> int:
+    return enable_startup()
+
+
+def uninstall() -> int:
+    return disable_startup()
+
+
+def status() -> int:
+    return startup_status()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Add or remove Donna from Windows startup (Current User Run key)."
+        description=(
+            "Add or remove Donna from user login/startup "
+            "(Windows Run key, macOS LaunchAgent, or Linux autostart)."
+        )
     )
     parser.add_argument(
         "action",
-        choices=("install", "uninstall", "status"),
-        help="install / uninstall / status",
+        choices=("install", "uninstall", "status", "enable", "disable"),
+        help="install|enable / uninstall|disable / status",
     )
     args = parser.parse_args(argv)
-    if args.action == "install":
-        return install()
-    if args.action == "uninstall":
-        return uninstall()
-    return status()
+    if args.action in ("install", "enable"):
+        return enable_startup()
+    if args.action in ("uninstall", "disable"):
+        return disable_startup()
+    return startup_status()
 
 
 if __name__ == "__main__":

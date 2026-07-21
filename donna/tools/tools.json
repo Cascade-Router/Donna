@@ -62,17 +62,17 @@
     },
     {
       "id": "analyze_visual_context",
-      "description_en": "VISION ONLY. Capture the screen or webcam, run JIT YOLOv8, and return a compact detection payload (class counts). Use for 'what do you see' / look-at-my-screen questions.",
+      "description_en": "Captures a frame from the primary monitor or camera and runs object detection to identify visible objects, windows, or visual context.",
       "parameters": [
         {
           "name": "source",
           "type": "string",
-          "required": false,
+          "required": true,
           "enum": [
             "screen",
-            "camera"
+            "webcam"
           ],
-          "description_en": "Capture source: primary monitor (screen) or webcam (camera).",
+          "description_en": "Where to capture the visual frame from. Defaults to 'screen'.",
           "description_fa": ""
         }
       ],
@@ -80,19 +80,22 @@
         "screen": [
           "what do you see on my screen",
           "what is on my screen",
+          "check what's on my screen",
+          "check what is on my screen",
           "look at my screen",
           "analyze my screen",
           "what do you see"
         ],
-        "camera": [
+        "webcam": [
           "what do you see on camera",
           "look at the camera",
-          "analyze the webcam"
+          "analyze the webcam",
+          "check the webcam"
         ]
       },
       "aliases_fa": {
         "screen": [],
-        "camera": []
+        "webcam": []
       }
     },
     {

@@ -159,21 +159,21 @@ async def run_react_langgraph(
             spoken = (
                 "I found the date but not a clear kickoff time yet."
                 if reply_lang != "fa"
-                else "تاریخ را پیدا کردم ولی ساعت دقیق را نه."
+                else "        ."
             )
         if re.match(
-            r"^\s*(?:TOOL|Action|FINAL|تابع|ابزار|پاسخ نهایی)\s*[:：]",
+            r"^\s*(?:TOOL|Action|FINAL||| )\s*[:：]",
             spoken or "",
             re.I,
         ):
             spoken = (
-                "ببخشید، دوباره بپرس."
+                "  ."
                 if reply_lang == "fa"
                 else "Sorry — please ask me again."
             )
         if spoken and spoken.lstrip().startswith("{") and '"tool"' in spoken:
             spoken = (
-                "ببخشید، دوباره بپرس."
+                "  ."
                 if reply_lang == "fa"
                 else "Sorry — please ask me again."
             )
@@ -207,30 +207,30 @@ async def run_react_langgraph(
                 spoken = (
                     "I'm researching that in the background — I'll speak up when it's ready."
                     if reply_lang != "fa"
-                    else "دارم تو پس‌زمینه روش تحقیق می‌کنم — وقتی آماده شد می‌گم."
+                    else "  ‌   ‌ —    ‌."
                 )
             elif forced_tool.tool_id == "dispatch_watchdog":
                 spoken = (
                     "Watchdog is running in the background — I'll speak up when it triggers."
                     if reply_lang != "fa"
-                    else "نگهبان رو گذاشتم؛ وقتی چیزی دید خبر می‌دم."
+                    else "       ‌."
                 )
             elif forced_tool.tool_id == "dispatch_titan_repair":
                 spoken = (
                     "I'm running Titan Repair over the bug tracker — patches will land in CAMGRASPER/tracker/pending_patches."
                     if reply_lang != "fa"
-                    else "دارم باگ‌تراکر رو بررسی می‌کنم و پچ‌های در انتظار می‌نویسم."
+                    else " ‌   ‌  ‌   ‌."
                 )
             elif forced_tool.tool_id == "architect_new_tool":
                 spoken = (
                     "I'm forging that tool through the Tool Forge now."
                     if reply_lang != "fa"
-                    else "دارم با Tool Forge برات ابزار می‌سازم."
+                    else "  Tool Forge   ‌."
                 )
             elif last_obs:
                 spoken = ag._obs_fallback(last_obs, reply_lang)
             else:
-                spoken = "Working on that now." if reply_lang != "fa" else "دارم روش کار می‌کنم."
+                spoken = "Working on that now." if reply_lang != "fa" else "   ‌."
         had_errors = trace_has_failure(trace)
         ag._maybe_record_bug_tracker(
             user_text=user_text,
@@ -458,6 +458,17 @@ async def run_react_langgraph(
                     )
                 except Exception:
                     pass
+                # Connection / timeout: abort immediately with a clear TTS line
+                # (do not retry as a Titan format error or fall through to
+                # "I didn't catch that.").
+                if ag.is_ollama_connection_error(exc):
+                    return {
+                        "messages": messages,
+                        "iterations": step,
+                        "last_obs": last_obs,
+                        "final_raw": ag.OLLAMA_UNREACHABLE_SPEECH,
+                        "halt": True,
+                    }
                 if attempt < max_retries:
                     messages.append(
                         SystemMessage(
@@ -474,7 +485,7 @@ async def run_react_langgraph(
                     else (
                         "Sorry — I couldn't complete that just now."
                         if reply_lang != "fa"
-                        else "متأسفم، الان نتوانستم پاسخ را کامل کنم."
+                        else "      ."
                     )
                 )
                 return {
@@ -492,7 +503,7 @@ async def run_react_langgraph(
                 else (
                     "Sorry — I couldn't complete that just now."
                     if reply_lang != "fa"
-                    else "متأسفم، الان نتوانستم پاسخ را کامل کنم."
+                    else "      ."
                 )
             )
             return {
@@ -549,7 +560,7 @@ async def run_react_langgraph(
             raw = ""
         answer = ag.extract_final(raw) or raw
         answer = re.sub(
-            r"^\s*(FINAL|Final|final|پاسخ نهایی)\s*[:：]\s*", "", answer
+            r"^\s*(FINAL|Final|final| )\s*[:：]\s*", "", answer
         ).strip()
         answer = ag.strip_protocol_speech_anchors(answer)
         answer = ag.strip_raw_json_from_speech(answer)
@@ -561,7 +572,7 @@ async def run_react_langgraph(
                 else (
                     "I didn't catch that."
                     if reply_lang != "fa"
-                    else "متوجه منظورتان نشدم."
+                    else "  ."
                 )
             )
         trace.append({"step": step, "final": True})
@@ -626,6 +637,16 @@ async def run_react_langgraph(
                             ),
                         )
                     )
+                elif tool_call.tool_id == "analyze_visual_context":
+                    # Direct JIT vision path → ToolMessage content for synthesis.
+                    from donna.vision_tools import analyze_visual_context as _analyze_visual
+
+                    src = str(
+                        (tool_call.arguments or {}).get("source") or "screen"
+                    ).strip().lower() or "screen"
+                    if src == "camera":
+                        src = "webcam"
+                    observation = str(_analyze_visual(source=src))
                 else:
                     tool_map = {getattr(t, "name", ""): t for t in tools}
                     st = tool_map.get(tool_call.tool_id)
@@ -824,6 +845,6 @@ async def run_react_langgraph(
         answer = (
             ag._obs_fallback(last_obs, reply_lang)
             if last_obs
-            else ("Done." if reply_lang != "fa" else "انجام شد.")
+            else ("Done." if reply_lang != "fa" else " .")
         )
     return _finish(answer, iterations)

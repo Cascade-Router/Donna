@@ -97,6 +97,7 @@ _VISUAL_TOOLS = frozenset(
     {
         "evaluate_slide_and_type",
         "capture_and_analyze_screen",
+        "analyze_visual_context",
         "describe_spatial_scene",
     }
 )

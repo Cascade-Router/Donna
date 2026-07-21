@@ -9,12 +9,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from donna.tools.normalize import detect_lang, normalize_farsi_text, normalize_tool_arguments
+from donna.tools.normalize import detect_lang, normalize_text, normalize_tool_arguments
 from donna.tools.schema import ToolCall, ToolSpec, load_tool_registry, tool_schema_public
 
 # LLM-style tool call patterns (EN / FA / mixed).
 _TOOL_CALL_RE = re.compile(
-    r"(?:tool|call|تابع|ابزار)\s*[:=]\s*([a-zA-Z_][\w]*)\s*(?:\((.*)\)|\{(.*)\})?",
+    r"(?:tool|call||)\s*[:=]\s*([a-zA-Z_][\w]*)\s*(?:\((.*)\)|\{(.*)\})?",
     re.IGNORECASE | re.DOTALL,
 )
 _KV_RE = re.compile(
@@ -237,9 +237,14 @@ _PUBLISH_TOOL_HINT_RE = re.compile(
 _VISUAL_HINT_RE = re.compile(
     r"("
     r"\bwhat am i looking at\b|\bwhat do you see\b|\bon my screen\b|"
+    r"\bcheck what(?:'s|\s+is)\s+on\s+my\s+screen\b|"
     r"\bdescribe the (?:screen|room|scene)\b|\blooking at\b|"
-    r"چی\s*میبینم|چه\s*میبینم|صحنه را توصیف|صفحه را توصیف"
+    r"\s*|\s*|  |  "
     r")",
+    re.IGNORECASE,
+)
+_WEBCAM_HINT_RE = re.compile(
+    r"\b(?:webcam|camera|look at me|on camera)\b",
     re.IGNORECASE,
 )
 # Explicit project-directory listing requests must not drift into read_local_file
@@ -581,7 +586,7 @@ class IntentBroker:
         if not raw:
             return None
         lang = detect_lang(raw)
-        norm = normalize_farsi_text(raw) if lang in ("fa", "mixed") else raw.lower()
+        norm = normalize_text(raw).lower() if lang != "en" else raw.lower()
 
         structured = self._parse_structured(raw, lang)
         if structured is not None:
@@ -602,7 +607,7 @@ class IntentBroker:
                 for enum_val, phrases in amap.items():
                     for phrase in phrases:
                         needle = (
-                            normalize_farsi_text(phrase)
+                            normalize_text(phrase)
                             if lang in ("fa", "mixed")
                             else phrase.lower()
                         )
@@ -706,6 +711,17 @@ class IntentBroker:
             return ToolCall(
                 tool_id="capture_and_analyze_screen",
                 arguments={"prompt": raw},
+                source_lang=lang,
+                raw_text=raw,
+                confidence=0.96,
+            )
+        # Visual look/see → JIT YOLO analyze_visual_context (bound in LangGraph).
+        if visual_hit and not mem_write_hit:
+            source = "webcam" if _WEBCAM_HINT_RE.search(raw) else "screen"
+            _foresight_cascade(raw, "analyze_visual_context")
+            return ToolCall(
+                tool_id="analyze_visual_context",
+                arguments={"source": source},
                 source_lang=lang,
                 raw_text=raw,
                 confidence=0.96,
@@ -1004,7 +1020,7 @@ class IntentBroker:
                 if param_name and enum_val not in enum:
                     continue
                 for phrase in phrases:
-                    p = normalize_farsi_text(phrase).lower()
+                    p = normalize_text(phrase).lower()
                     if v == p or v == enum_val or phrase.lower() == v:
                         return enum_val
         for e in enum:

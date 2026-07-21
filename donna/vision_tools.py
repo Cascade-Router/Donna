@@ -183,12 +183,12 @@ def analyze_visual_context(source: str = "screen") -> str:
     """Capture a frame, run JIT YOLO, return a clean text payload for the LLM.
 
     Args:
-        source: ``\"screen\"`` (mss primary monitor) or ``\"camera\"`` / ``\"webcam\"``.
+        source: ``\"screen\"`` (mss primary monitor) or ``\"webcam\"`` / ``\"camera\"``.
     """
-    kind = str(source or "screen").strip().lower()
-    if kind in {"camera", "webcam", "video"}:
+    kind = str(source or "screen").strip().lower() or "screen"
+    if kind in {"webcam", "camera", "video"}:
         frame = capture_webcam_frame()
-        source_label = "camera"
+        source_label = "webcam"
     else:
         frame = capture_screen_frame()
         source_label = "screen"

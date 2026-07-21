@@ -4113,14 +4113,18 @@ def execute_tool_call(tc: ToolCall) -> str:
         return f"OK: switched vision to {source}"
 
     def _handle_analyze_visual(call: ToolCall) -> str:
+        """Dispatch to JIT YOLO; observation is already ``[Vision Output] …``."""
         from donna.vision_tools import analyze_visual_context
 
         source = str(call.arguments.get("source") or "screen").strip().lower()
-        if source not in {"screen", "camera", "webcam", "video"}:
+        if source not in {"screen", "webcam", "camera", "video"}:
             with active_vision_lock:
                 source = (
-                    "camera" if active_vision_tool is camera_tool else "screen"
+                    "webcam" if active_vision_tool is camera_tool else "screen"
                 )
+        # Schema enum is screen|webcam; vision_tools also accepts camera.
+        if source == "camera":
+            source = "webcam"
         return analyze_visual_context(source=source)
 
     def _handle_describe_spatial(call: ToolCall) -> str:
@@ -4128,7 +4132,7 @@ def execute_tool_call(tc: ToolCall) -> str:
         from donna.vision_tools import analyze_visual_context
 
         with active_vision_lock:
-            source = "camera" if active_vision_tool is camera_tool else "screen"
+            source = "webcam" if active_vision_tool is camera_tool else "screen"
         payload = analyze_visual_context(source=source)
         focus = str(call.arguments.get("focus") or "all")
         block = SPATIAL_AGGREGATOR.synthesize_prompt_block()

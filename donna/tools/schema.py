@@ -97,3 +97,45 @@ def tool_schema_public(registry: dict[str, ToolSpec]) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def to_openai_function_schema(spec: ToolSpec) -> dict[str, Any]:
+    """OpenAI / Ollama function-calling schema for a single ToolSpec."""
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for param in spec.parameters:
+        prop: dict[str, Any] = {
+            "type": param.type or "string",
+            "description": param.description_en or param.name,
+        }
+        if param.enum:
+            prop["enum"] = list(param.enum)
+        properties[param.name] = prop
+        if param.required:
+            required.append(param.name)
+    return {
+        "type": "function",
+        "function": {
+            "name": spec.id,
+            "description": (spec.description_en or spec.id).strip(),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+
+def openai_tools_schema(
+    registry: dict[str, ToolSpec],
+    *,
+    tool_ids: set[str] | frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """OpenAI-style tools array suitable for Ollama / LangGraph bind_tools."""
+    out: list[dict[str, Any]] = []
+    for spec in registry.values():
+        if tool_ids is not None and spec.id not in tool_ids:
+            continue
+        out.append(to_openai_function_schema(spec))
+    return out

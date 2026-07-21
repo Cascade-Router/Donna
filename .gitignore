@@ -29,6 +29,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# PyInstaller
+build/
+dist/
+*.egg-info/
+
 # Repo-rooted runtime workspace (DONNA_WORKSPACE == CAMGRASPER)
 /logs/
 /tracker/

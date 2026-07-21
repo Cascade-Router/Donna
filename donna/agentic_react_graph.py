@@ -20,6 +20,16 @@ from donna.tools.broker import IntentBroker, ToolValidationError, get_broker
 from donna.tools.schema import ToolCall
 
 
+def _emit_live_trace(event_type: str, **payload: Any) -> None:
+    """Non-blocking Live Trace bus emit (safe from LangGraph worker threads)."""
+    try:
+        from donna.ui.trace_bus import emit_trace_event
+
+        emit_trace_event(event_type, **payload)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class ReactGraphState(TypedDict):
     """LangGraph ReAct state — messages use add_messages reducer."""
 
@@ -408,6 +418,13 @@ async def run_react_langgraph(
         nonlocal llm_with_tools, last_obs
         messages = list(state.get("messages") or [])
         step = int(state.get("iterations") or 0) + 1
+        _emit_live_trace(
+            "node_enter",
+            node="agent",
+            message=f"Router/Synthesis step {step}",
+            mode=ag.get_donna_mode(),
+            state_keys=("messages", "iterations"),
+        )
         ag.sanitize_react_message_history(messages)
         response = None
         max_retries = 3
@@ -590,6 +607,13 @@ async def run_react_langgraph(
         messages = list(state.get("messages") or [])
         last = messages[-1] if messages else None
         tool_calls = list(getattr(last, "tool_calls", None) or []) if last else []
+        _emit_live_trace(
+            "node_enter",
+            node="tools",
+            message=f"Tool node ({len(tool_calls)} call(s))",
+            mode=ag.get_donna_mode(),
+            state_keys=("messages", "last_obs"),
+        )
         new_msgs: list[Any] = []
         for tc_raw in tool_calls:
             tool_call = ag._tool_call_from_lc(tc_raw, raw_text=user_text)
@@ -673,6 +697,15 @@ async def run_react_langgraph(
                     pass
             last_obs = ag.sanitize_react_observation(str(observation), max_chars=8000)
             llm_obs = ag.sanitize_react_observation(last_obs)
+            _emit_live_trace(
+                "tool_execution",
+                node="tools",
+                tool=tool_call.tool_id,
+                message=f"Tool: {tool_call.tool_id}",
+                mode=ag.get_donna_mode(),
+                payload=llm_obs[:800],
+                state_keys=("last_obs",),
+            )
             if tool_call.tool_id == "draft_cursor_prompt":
                 ag.log_tool_receipt_console(last_obs, tool_id=tool_call.tool_id)
             trace.append(
@@ -773,26 +806,76 @@ async def run_react_langgraph(
     think_tts_filter = ag.ThinkBlockTtsFilter()
     # After draft_cursor_prompt, mute model stream (ticket body echoes) — final ack only.
     mute_post_ticket_stream = False
+    _graph_t0 = time.perf_counter()
+    _emit_live_trace(
+        "node_enter",
+        node="router",
+        message="LangGraph ReAct start",
+        mode=ag.get_donna_mode(),
+        state_keys=("messages",),
+    )
+    _chain_t0: dict[str, float] = {}
     async for event in graph.astream_events(inputs, config=config, version="v2"):
         kind = str(event.get("event") or "")
+        name = str(event.get("name") or "")
+        if kind == "on_chain_start" and name in {"agent", "tools"}:
+            _chain_t0[name] = time.perf_counter()
+            _emit_live_trace(
+                "node_enter",
+                node=name,
+                message=f"chain start: {name}",
+                mode=ag.get_donna_mode(),
+            )
+        elif kind == "on_chain_end" and name in {"agent", "tools"}:
+            t0 = _chain_t0.pop(name, None)
+            ms = (time.perf_counter() - t0) * 1000.0 if t0 is not None else None
+            _emit_live_trace(
+                "node_exit",
+                node=name,
+                message=f"chain end: {name}",
+                mode=ag.get_donna_mode(),
+                latency_ms=ms,
+            )
         if kind == "on_chat_model_start":
             # Mute "Thinking..." — R1 plans inside <think>; speak only outer text.
             think_tts_filter.reset()
             ag.reset_stream_sentence_tts()
+            _emit_live_trace(
+                "status",
+                node="synthesis",
+                message="LLM synthesis streaming",
+                mode=ag.get_donna_mode(),
+            )
         elif kind == "on_tool_start":
             # Flush any buffered speech before tool-status TTS.
             ag.flush_stream_sentence_tts()
             tool_name = str(event.get("name") or "tool")
             ag._enqueue_tts_nonblocking(ag._friendly_tool_tts(tool_name))
+            _emit_live_trace(
+                "tool_execution",
+                node="tools",
+                tool=tool_name,
+                message=f"on_tool_start: {tool_name}",
+                mode=ag.get_donna_mode(),
+            )
             if tool_name == "draft_cursor_prompt":
                 mute_post_ticket_stream = True
         elif kind == "on_tool_end":
             # Mute raw tool payloads — never speak JSON / OK: observations.
             tool_name = str(event.get("name") or "")
+            data = event.get("data") or {}
+            output = data.get("output")
+            _emit_live_trace(
+                "state_update",
+                node="tools",
+                tool=tool_name,
+                message=f"on_tool_end: {tool_name}",
+                mode=ag.get_donna_mode(),
+                payload=str(output or "")[:800],
+                state_keys=("messages", "last_obs"),
+            )
             if tool_name == "draft_cursor_prompt":
                 mute_post_ticket_stream = True
-                data = event.get("data") or {}
-                output = data.get("output")
                 if output is not None:
                     ag.log_tool_receipt_console(str(output), tool_id=tool_name)
         elif kind == "on_chat_model_stream":
@@ -847,4 +930,13 @@ async def run_react_langgraph(
             if last_obs
             else ("Done." if reply_lang != "fa" else " .")
         )
+    _emit_live_trace(
+        "node_exit",
+        node="synthesis",
+        message="ReAct complete",
+        mode=ag.get_donna_mode(),
+        payload=answer[:800],
+        latency_ms=(time.perf_counter() - _graph_t0) * 1000.0,
+        state_keys=("final_raw", "last_obs", "messages"),
+    )
     return _finish(answer, iterations)

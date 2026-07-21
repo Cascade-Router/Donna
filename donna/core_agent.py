@@ -227,7 +227,7 @@ def emit_trace(
     message: str,
     mode: str | None = None,
 ) -> None:
-    """Push one Live Trace event onto ``gui_telemetry_queue`` (thread-safe)."""
+    """Push one Live Trace event (thread-safe; UI drains on Tk main thread)."""
     payload = {
         "stage": str(stage or "").strip() or "stage",
         "status": str(status or "active").strip().lower(),
@@ -238,6 +238,21 @@ def emit_trace(
         payload["status"] = "active"
     try:
         gui_telemetry_queue.put_nowait(payload)
+    except Exception:  # noqa: BLE001
+        pass
+    # Canonical bus for LiveTracePanel (never touches Tk from worker threads).
+    try:
+        from donna.ui.trace_bus import emit_trace_event
+
+        status_l = payload["status"]
+        et = "node_enter" if status_l == "active" else "node_exit"
+        emit_trace_event(
+            et,
+            node=payload["stage"],
+            message=payload["message"],
+            mode=payload["mode"] or "",
+            payload=payload["message"],
+        )
     except Exception:  # noqa: BLE001
         pass
 
@@ -6835,12 +6850,21 @@ class DonnaGUI(ctk.CTk):
         tab_audio = tabs.add("Audio Settings")
         tab_transcript = tabs.add("Live Transcript")
 
-        self.trace_scroll = ctk.CTkScrollableFrame(
-            tab_trace,
-            label_text="Pipeline stages",
-            label_anchor="w",
-        )
-        self.trace_scroll.pack(fill="both", expand=True, padx=8, pady=8)
+        # LangGraph Live Trace panel (queue drain via self.after — never worker threads).
+        try:
+            from donna.ui.trace_window import LiveTracePanel
+
+            self.live_trace = LiveTracePanel(tab_trace, poll_ms=50)
+            self.live_trace.pack(fill="both", expand=True, padx=4, pady=4)
+            self.trace_scroll = self.live_trace.timeline
+        except Exception:  # noqa: BLE001
+            self.live_trace = None
+            self.trace_scroll = ctk.CTkScrollableFrame(
+                tab_trace,
+                label_text="Pipeline stages",
+                label_anchor="w",
+            )
+            self.trace_scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
         ctk.CTkLabel(tab_stats, text="Current Status", anchor="w").pack(
             fill="x", padx=12, pady=(16, 2)
@@ -6914,7 +6938,11 @@ class DonnaGUI(ctk.CTk):
         self._reload_device_menus()
 
     def process_telemetry(self) -> None:
-        """Drain ``gui_telemetry_queue`` on the Tk main thread (~10 Hz)."""
+        """Drain legacy ``gui_telemetry_queue`` on the Tk main thread (~10 Hz).
+
+        Primary Live Trace rendering is owned by ``LiveTracePanel`` (50ms bus poll).
+        This path keeps header mode / fallback TraceCells in sync.
+        """
         if not self.winfo_exists():
             return
         try:
@@ -6931,6 +6959,9 @@ class DonnaGUI(ctk.CTk):
                 mode = event.get("mode")
                 if mode:
                     self._set_mode_indicator(str(mode))
+                # When LiveTracePanel is mounted, skip duplicate TraceCell rows.
+                if getattr(self, "live_trace", None) is not None:
+                    continue
                 accent = self._mode_accent(
                     str(mode) if mode else self._header_mode
                 )
@@ -7141,6 +7172,11 @@ def parse_args() -> argparse.Namespace:
         "--reset-vault",
         action="store_true",
         help="Delete donna_memory.enc and exit so the next run creates a fresh vault.",
+    )
+    parser.add_argument(
+        "--no-gui",
+        action="store_true",
+        help="Headless mode: skip CustomTkinter Live Trace / tray UI.",
     )
     return parser.parse_args()
 
@@ -7403,6 +7439,20 @@ def main() -> int:
         reset_donna_vault()
         return 0
 
+    log("Main", f"Runtime log -> {log_path}")
+    log("Main", f"Conversation log (latest) -> {CONVERSATION_LOG_PATH}")
+
+    # Headless: no CustomTkinter / tray — agent loop owns the process.
+    if getattr(args, "no_gui", False):
+        try:
+            from donna.ui.trace_bus import get_trace_bus
+
+            get_trace_bus().set_enabled(False)
+        except Exception:  # noqa: BLE001
+            pass
+        log("Main", "Headless mode (--no-gui): Live Trace UI disabled.")
+        return agent_loop(args)
+
     # Create GUI first so Live Transcript / Trace are ready before Whisper/Ollama emit.
     gui = DonnaGUI()
     _gui_instance = gui
@@ -7417,8 +7467,6 @@ def main() -> int:
         emit_trace("Router", "active", "Router: waiting for turn")
     except Exception:  # noqa: BLE001
         pass
-    log("Main", f"Runtime log -> {log_path}")
-    log("Main", f"Conversation log (latest) -> {CONVERSATION_LOG_PATH}")
 
     def _on_window_close() -> None:
         log("Main", "Window close requested — shutting down.")

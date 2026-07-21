@@ -13,7 +13,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import platform
+import shlex
 import sys
 from pathlib import Path
 
@@ -22,39 +24,50 @@ MACOS_LABEL = "com.donna.agent"
 MACOS_PLIST_NAME = f"{MACOS_LABEL}.plist"
 LINUX_DESKTOP_NAME = "donna.desktop"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+UNIX_STARTUP_LOG = "/tmp/donna_startup.log"
 
 
 def project_root() -> Path:
     from donna.paths import PROJECT_ROOT
 
-    return PROJECT_ROOT
+    return Path(os.path.abspath(str(PROJECT_ROOT)))
+
+
+def absolute_workdir() -> str:
+    """Absolute Donna repo path for WorkingDirectory / batch ``cd``."""
+    try:
+        return os.path.abspath(str(project_root()))
+    except Exception:  # noqa: BLE001
+        return os.path.abspath(os.getcwd())
 
 
 def _system() -> str:
     return platform.system()
 
 
-def python_launcher() -> Path:
-    """Prefer a windowless / venv interpreter when present."""
+def python_launcher(*, headless: bool = True) -> Path:
+    """Prefer a venv interpreter; headless startup uses console ``python`` (not pythonw)."""
     root = project_root()
     system = _system()
     if system == "Windows":
         venv = root / ".venv" / "Scripts"
-        for name in ("pythonw.exe", "python.exe"):
+        # Headless needs a console interpreter so stdout/stderr redirect to the log.
+        order = ("python.exe", "pythonw.exe") if headless else ("pythonw.exe", "python.exe")
+        for name in order:
             candidate = venv / name
             if candidate.is_file():
-                return candidate
+                return Path(os.path.abspath(str(candidate)))
     else:
         venv_bin = root / ".venv" / "bin"
         for name in ("python3", "python"):
             candidate = venv_bin / name
             if candidate.is_file():
-                return candidate
-    return Path(sys.executable)
+                return Path(os.path.abspath(str(candidate)))
+    return Path(os.path.abspath(sys.executable))
 
 
 def entry_script() -> Path:
-    return project_root() / "run.py"
+    return Path(os.path.abspath(str(project_root() / "run.py")))
 
 
 def bat_path() -> Path:
@@ -62,14 +75,15 @@ def bat_path() -> Path:
 
 
 def write_start_bat() -> Path:
-    """Create ``start_donna.bat`` that launches ``run.py`` from the project venv."""
-    root = project_root()
-    py = python_launcher()
-    entry = entry_script()
+    """Create ``start_donna.bat``: abs ``cd``, ``--no-gui``, log redirect."""
+    root = absolute_workdir()
+    py = str(python_launcher(headless=True))
+    entry = str(entry_script())
+    # Do not use ``start`` — it detaches and breaks ``> log 2>&1`` capture.
     lines = [
         "@echo off",
         f'cd /d "{root}"',
-        f'start "" "{py}" "{entry}"',
+        f'"{py}" "{entry}" --no-gui > "%TEMP%\\donna_startup.log" 2>&1',
         "",
     ]
     path = bat_path()
@@ -86,9 +100,10 @@ def linux_desktop_path() -> Path:
 
 
 def _write_macos_plist() -> Path:
-    root = project_root()
-    py = python_launcher()
-    entry = entry_script()
+    root = absolute_workdir()
+    py = str(python_launcher(headless=True))
+    entry = str(entry_script())
+    log_path = UNIX_STARTUP_LOG
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -99,9 +114,14 @@ def _write_macos_plist() -> Path:
 \t<array>
 \t\t<string>{py}</string>
 \t\t<string>{entry}</string>
+\t\t<string>--no-gui</string>
 \t</array>
 \t<key>WorkingDirectory</key>
 \t<string>{root}</string>
+\t<key>StandardOutPath</key>
+\t<string>{log_path}</string>
+\t<key>StandardErrorPath</key>
+\t<string>{log_path}</string>
 \t<key>RunAtLoad</key>
 \t<true/>
 \t<key>KeepAlive</key>
@@ -116,16 +136,20 @@ def _write_macos_plist() -> Path:
 
 
 def _write_linux_desktop() -> Path:
-    root = project_root()
-    py = python_launcher()
-    entry = entry_script()
+    root = absolute_workdir()
+    py = str(python_launcher(headless=True))
+    entry = str(entry_script())
+    log_path = UNIX_STARTUP_LOG
+    # Desktop Entry Exec → bash -c with stdout/stderr piped to the startup log.
+    inner = f"{shlex.quote(py)} {shlex.quote(entry)} --no-gui > {log_path} 2>&1"
+    exec_cmd = f"/bin/bash -c {shlex.quote(inner)}"
     body = (
         "[Desktop Entry]\n"
         "Type=Application\n"
         "Version=1.0\n"
         "Name=Donna\n"
-        "Comment=Donna local-first voice agent\n"
-        f'Exec="{py}" "{entry}"\n'
+        "Comment=Donna local-first voice agent (headless)\n"
+        f"Exec={exec_cmd}\n"
         f"Path={root}\n"
         "Terminal=false\n"
         "X-GNOME-Autostart-enabled=true\n"

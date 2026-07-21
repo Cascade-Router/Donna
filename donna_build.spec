@@ -44,6 +44,9 @@ hiddenimports: list[str] = [
     "piper",
     "ultralytics",
     "cv2",
+    "mss",
+    "donna.vision_tools",
+    "vision_tools",
     "PIL",
     "langchain_ollama",
     "langgraph",
@@ -89,6 +92,8 @@ for _pkg in (
     "torchvision",
     "transformers",
     "whisper",
+    "ultralytics",
+    "mss",
 ):
     _safe_collect_all(_pkg)
 

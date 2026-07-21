@@ -5,7 +5,7 @@ Pipeline (4 threads + agent keep-alive loop + GUI main thread):
   1. Tracker   - YOLOv8n on active_vision_tool.get_frame() (~10 FPS)
   2. WakeWord  - OpenWakeWord custom "donna.onnx" on mic @ 16 kHz
   3. Conversation - VAD -> Whisper STT -> tool_router -> YOLO + Ollama LLM -> TTS
-  4. Audio     - offline TTS via piper-tts (en_US HFC female + fa_IR Amir)
+  4. Audio     - offline TTS via piper-tts (en_US HFC female)
 
 UI:
   - Windows system tray icon (Open Settings / Quit)
@@ -281,28 +281,12 @@ _CANNED_UX_WAV_FILES: dict[str, str] = {
     "Vision mode active.": "vision_mode_active.wav",
     "Research mode active.": "research_mode_active.wav",
     "Memory cleared.": "memory_cleared.wav",
-    "تیکت روی بورد ثبت شد.": "ticket_on_board_fa.wav",
 }
 # Runtime / conversation log paths live in donna.logging (re-exported above).
 PIPER_EN_ONNX = os.path.join(TTS_MODELS_DIR, "en_US-hfc_female-medium.onnx")
 PIPER_EN_JSON = os.path.join(TTS_MODELS_DIR, "en_US-hfc_female-medium.onnx.json")
-# Preferred name kept as "taraneh" for Donna's female Farsi voice. Official
-# rhasspy/piper-voices has no taraneh (404); we download Mana (female) and/or
-# fall back if the preferred URL is missing.
-PIPER_FA_ONNX = os.path.join(TTS_MODELS_DIR, "fa_IR-taraneh-medium.onnx")
-PIPER_FA_JSON = os.path.join(TTS_MODELS_DIR, "fa_IR-taraneh-medium.onnx.json")
-PIPER_FA_URL_CANDIDATES: tuple[tuple[str, str], ...] = (
-    # User-requested Taraneh (may 404 — not published on rhasspy/piper-voices).
-    (
-        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/fa/fa_IR/taraneh/medium/fa_IR-taraneh-medium.onnx",
-        "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/fa/fa_IR/taraneh/medium/fa_IR-taraneh-medium.onnx.json",
-    ),
-    # Community female Persian Piper voice (Mana).
-    (
-        "https://huggingface.co/MahtaFetrat/Mana-Persian-Piper/resolve/main/fa_IR-mana-medium.onnx",
-        "https://huggingface.co/MahtaFetrat/Mana-Persian-Piper/resolve/main/fa_IR-mana-medium.onnx.json",
-    ),
-)
+# Incomplete localization voices are disabled for the public release.
+# Related local Piper assets remain gitignored under tts_models/.
 PIPER_MODEL_URLS: tuple[tuple[str, str], ...] = (
     (
         PIPER_EN_ONNX,
@@ -336,7 +320,7 @@ def _download_file(url: str, dest: str) -> None:
 
 
 def download_piper_models() -> None:
-    """Download English + female Persian Piper voices into tts_models/ if missing."""
+    """Download the English Piper voice into tts_models/ if missing."""
     os.makedirs(TTS_MODELS_DIR, exist_ok=True)
     for dest, url in PIPER_MODEL_URLS:
         if os.path.isfile(dest) and os.path.getsize(dest) > 0:
@@ -349,41 +333,10 @@ def download_piper_models() -> None:
                     os.remove(dest + ".partial")
             except OSError:
                 pass
-            raise RuntimeError(f"Failed to download Piper model from {url}: {exc}") from exc
+            raise RuntimeError(
+                f"Failed to download Piper model from {url}: {exc}"
+            ) from exc
 
-    fa_ready = (
-        os.path.isfile(PIPER_FA_ONNX)
-        and os.path.getsize(PIPER_FA_ONNX) > 0
-        and os.path.isfile(PIPER_FA_JSON)
-        and os.path.getsize(PIPER_FA_JSON) > 0
-    )
-    if fa_ready:
-        return
-
-    last_err: Optional[Exception] = None
-    for onnx_url, json_url in PIPER_FA_URL_CANDIDATES:
-        try:
-            _download_file(onnx_url, PIPER_FA_ONNX)
-            _download_file(json_url, PIPER_FA_JSON)
-            if "mana" in onnx_url.lower():
-                print(
-                    "[TTS] Taraneh not available on HuggingFace; "
-                    "using Mana female Persian Piper voice instead.",
-                    flush=True,
-                )
-            return
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-            for path in (PIPER_FA_ONNX, PIPER_FA_JSON, PIPER_FA_ONNX + ".partial", PIPER_FA_JSON + ".partial"):
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                except OSError:
-                    pass
-            continue
-    raise RuntimeError(
-        f"Failed to download a female Persian Piper voice: {last_err}"
-    ) from last_err
 
 # webrtcvad still does `pkg_resources.get_distribution(...).version`.
 # Always inject an importlib.metadata shim *before* importing webrtcvad so we
@@ -590,8 +543,8 @@ donna_vault: Optional["SecureMemory"] = None
 # High-frequency identity keys prefetched post-unlock (skip ReAct vault tools).
 VAULT_HOT_CACHE: dict[str, str] = {}
 
-# Farsi / Arabic script detection for TTS voice routing.
-FARSI_CHAR_RE = re.compile(r"[\u0600-\u06FF]")
+# Optional Arabic-script detection (unused for English-only TTS routing).
+ARABIC_SCRIPT_RE = re.compile(r"[\u0600-\u06FF]")
 
 # Short-term spatial memory so flickering detections still answer "where is X?"
 spatial_memory_lock = threading.Lock()
@@ -952,7 +905,7 @@ def is_punctuation_or_whitespace_only(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return True
-    if FARSI_CHAR_RE.search(raw) or re.search(r"[A-Za-z0-9]", raw):
+    if ARABIC_SCRIPT_RE.search(raw) or re.search(r"[A-Za-z0-9]", raw):
         return False
     return bool(_PUNCT_OR_SPACE_ONLY_RE.fullmatch(raw))
 
@@ -986,7 +939,7 @@ def is_whisper_hallucination(
 ) -> bool:
     """Reject empty, ultra-short, bracketed non-speech, or known silence hallucinations.
 
-    Farsi/Arabic-script utterances are allowed even when short (e.g. سلام).
+    Short non-Latin script utterances are allowed when they contain letters.
     Do not hardcode language-specific spam tokens here — diagnose low-SNR
     captures via STT debug logs instead.
     When ``audio_duration_s`` is provided, also apply the duration-to-word
@@ -1014,9 +967,9 @@ def is_whisper_hallucination(
     if not paren_stripped:
         return True
 
-    # Persian/Arabic script: keep short real phrases; only drop pure noise/punct.
-    if FARSI_CHAR_RE.search(raw):
-        letters = FARSI_CHAR_RE.findall(raw)
+    # Non-Latin script: keep short real phrases; only drop pure noise/punct.
+    if ARABIC_SCRIPT_RE.search(raw):
+        letters = ARABIC_SCRIPT_RE.findall(raw)
         return len(letters) < 1
 
     cleaned = raw.lower().strip(" .,!?;:\"'`")
@@ -1080,8 +1033,8 @@ _STANDBY_PHRASES = frozenset(
         "stop",
         "goodbye",
         "good bye",
-        "استندبای",
-        "خاموش",
+        "",
+        "",
     }
 )
 _STANDBY_TAIL_WORDS = frozenset(
@@ -1105,9 +1058,9 @@ _CLEAR_CONTEXT_PHRASES = frozenset(
         "wipe memory",
         "new conversation",
         "fresh start",
-        "حافظه را پاک کن",
-        "فراموش کن",
-        "از اول",
+        "   ",
+        " ",
+        " ",
     }
 )
 
@@ -1154,8 +1107,8 @@ def is_standby_command(text: str) -> bool:
     words = [w for w in re.split(r"\s+", ascii_norm) if w]
     if words and words[-1].strip(".,!?;:\"'`") in _STANDBY_TAIL_WORDS:
         return True
-    # Exact Farsi phrase match after light whitespace normalize.
-    fa_norm = re.sub(r"\s+", " ", raw).strip(" .,!؟?;:\"'`")
+    # Exact phrase match after light whitespace normalize.
+    fa_norm = re.sub(r"\s+", " ", raw).strip(" .,!?;:\"'`")
     return fa_norm in _STANDBY_PHRASES
 
 
@@ -1176,7 +1129,7 @@ def is_clear_context_command(text: str) -> bool:
             # of a multi-word phrase mid-word; require phrase as contiguous tokens.
             if phrase in ascii_norm:
                 return True
-    fa_norm = re.sub(r"\s+", " ", raw).strip(" .,!؟?;:\"'`")
+    fa_norm = re.sub(r"\s+", " ", raw).strip(" .,!?;:\"'`")
     return fa_norm in _CLEAR_CONTEXT_PHRASES
 
 
@@ -1213,7 +1166,7 @@ def clear_context_spoken_reply(text: str = "") -> str:
     from donna.settings import resolve_reply_lang
 
     if resolve_reply_lang(text or "") == "fa":
-        return "باشه — از اول شروع می‌کنیم."
+        return " —    ‌."
     return "Okay — fresh start. Context cleared."
 
 
@@ -1664,21 +1617,21 @@ def speak_tool_working_ack(call: ToolCall, reply_lang: str) -> None:
     tool_id = getattr(call, "tool_id", "") or ""
     if reply_lang == "fa":
         phrase = {
-            "web_search": "بذار چک کنم.",
-            "describe_spatial_scene": "بذار نگاه کنم.",
-            "read_vault_memory": "بذار حافظه‌ام رو چک کنم.",
-            "read_clipboard_context": "بذار کلیپ‌بورد رو ببینم.",
-            "run_terminal_command": "بذار تو ترمینال چک کنم.",
-            "flush_memory": "باشه، حافظه کوتاه‌مدت رو پاک می‌کنم.",
-            "publish_tool_to_general": "باشه، ابزار رو به عمومی ارتقا می‌دم.",
-            "open_application": "باشه، برنامه رو باز می‌کنم.",
-            "read_local_file": "بذار فایل رو بخونم.",
-            "read_system_architecture": "بذار ببینم.",
-            "dispatch_research_swarm": "تحقیق رو به تیم می‌سپارم.",
-            "dispatch_watchdog": "باشه، نگهبان رو می‌ذارم.",
-            "kill_watchdog": "باشه، نگهبان رو قطع می‌کنم.",
-            "save_script_to_library": "باشه، اسکریپت رو تو کتابخانه ذخیره می‌کنم.",
-        }.get(tool_id, "بذار ببینم.")
+            "web_search": "  .",
+            "describe_spatial_scene": "  .",
+            "read_vault_memory": " ‌   .",
+            "read_clipboard_context": " ‌  .",
+            "run_terminal_command": "    .",
+            "flush_memory": "  ‌   ‌.",
+            "publish_tool_to_general": "      ‌.",
+            "open_application": "    ‌.",
+            "read_local_file": "   .",
+            "read_system_architecture": " .",
+            "dispatch_research_swarm": "    ‌.",
+            "dispatch_watchdog": "   ‌.",
+            "kill_watchdog": "    ‌.",
+            "save_script_to_library": "      ‌.",
+        }.get(tool_id, " .")
     else:
         phrase = {
             "web_search": "Let me check.",
@@ -2477,12 +2430,12 @@ def wake_phrase_confirmed(audio_16k: np.ndarray) -> bool:
                     moved[key] = value.to(device=device)
             else:
                 moved[key] = value
-        gen_kwargs: dict[str, Any] = {
-            "max_new_tokens": 32,
-            "language": "english",
-            "task": "transcribe",
-            "condition_on_prev_tokens": False,
-        }
+        _sanitize_whisper_generation_config(model)
+        gen_kwargs = _whisper_generate_kwargs(
+            max_new_tokens=32,
+            language="english",
+            task="transcribe",
+        )
         with torch.no_grad():
             generated_ids = model.generate(
                 **moved,
@@ -2850,12 +2803,52 @@ def load_whisper(local_files_only: bool, device):
         local_files_only=local_files_only,
     ).to(whisper_device)
     model.eval()
+    # Prefer max_new_tokens-only length control. Whisper configs ship with
+    # max_length=448; leaving both set triggers transformers warnings.
+    _sanitize_whisper_generation_config(model)
     log(
         "Conversation",
         f"Whisper ready in {time.perf_counter() - t0:.1f}s on {whisper_device} "
         f"(dtype={whisper_dtype}).",
     )
     return processor, model, whisper_dtype, whisper_device
+
+
+def _sanitize_whisper_generation_config(model: Any) -> None:
+    """Drop conflicting length / processor fields from Whisper generation_config."""
+    gc = getattr(model, "generation_config", None)
+    if gc is None:
+        return
+    # max_new_tokens alone must control length (do not keep max_length).
+    if getattr(gc, "max_length", None) is not None:
+        try:
+            gc.max_length = None
+        except Exception:  # noqa: BLE001
+            pass
+    # Never keep a stale max_new_tokens on the config — callers pass it per call.
+    if hasattr(gc, "max_new_tokens"):
+        try:
+            gc.max_new_tokens = None
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _whisper_generate_kwargs(
+    *,
+    max_new_tokens: int,
+    language: str,
+    task: str,
+) -> dict[str, Any]:
+    """Generation kwargs for Whisper STT — max_new_tokens only, no logits_processor."""
+    return {
+        "max_new_tokens": int(max_new_tokens),
+        "language": language,
+        "task": task,
+        "condition_on_prev_tokens": False,
+        # Intentionally omitted: max_length, logits_processor, suppress_tokens,
+        # begin_suppress_tokens — transformers builds SuppressTokens* processors
+        # from generation_config; passing them again duplicates and warns.
+    }
 
 
 def ensure_whisper_bundle(timeout: float = 180.0):
@@ -4022,12 +4015,12 @@ def transcribe_audio(
 
     whisper_lang = get_whisper_language()
     # Fresh VAD capture: never condition on previous text / ticket logs.
-    gen_kwargs: dict[str, Any] = {
-        "max_new_tokens": 128,
-        "language": whisper_lang,
-        "task": WHISPER_TASK,
-        "condition_on_prev_tokens": False,
-    }
+    _sanitize_whisper_generation_config(whisper_model)
+    gen_kwargs = _whisper_generate_kwargs(
+        max_new_tokens=128,
+        language=whisper_lang,
+        task=WHISPER_TASK,
+    )
     with torch.no_grad():
         generated_ids = whisper_model.generate(
             **moved,
@@ -4119,11 +4112,28 @@ def execute_tool_call(tc: ToolCall) -> str:
         log("Router", f"Vision tool -> {source} via IR {call.tool_id}")
         return f"OK: switched vision to {source}"
 
+    def _handle_analyze_visual(call: ToolCall) -> str:
+        from donna.vision_tools import analyze_visual_context
+
+        source = str(call.arguments.get("source") or "screen").strip().lower()
+        if source not in {"screen", "camera", "webcam", "video"}:
+            with active_vision_lock:
+                source = (
+                    "camera" if active_vision_tool is camera_tool else "screen"
+                )
+        return analyze_visual_context(source=source)
+
     def _handle_describe_spatial(call: ToolCall) -> str:
+        # Prefer live JIT YOLO payload; keep SpatialIR as secondary context.
+        from donna.vision_tools import analyze_visual_context
+
+        with active_vision_lock:
+            source = "camera" if active_vision_tool is camera_tool else "screen"
+        payload = analyze_visual_context(source=source)
         focus = str(call.arguments.get("focus") or "all")
         block = SPATIAL_AGGREGATOR.synthesize_prompt_block()
         hint = spatial_focus_hint(focus)
-        return f"SpatialIR={block} | {hint}"
+        return f"{payload} | SpatialIR={block} | {hint}"
 
     def _handle_read_vault(call: ToolCall) -> str:
         global donna_profile
@@ -4584,6 +4594,7 @@ def execute_tool_call(tc: ToolCall) -> str:
 
     handlers = {
         "switch_vision_source": _handle_switch_vision,
+        "analyze_visual_context": _handle_analyze_visual,
         "describe_spatial_scene": _handle_describe_spatial,
         "read_vault_memory": _handle_read_vault,
         "write_vault_memory": _handle_write_vault,
@@ -4641,11 +4652,11 @@ def tool_router(whisper_text: str) -> tuple[str, Optional[ToolCall]]:
         log("Router", f"Fast-path switch: {obs}")
         if obs.startswith("OK: switched"):
             ack = (
-                "در حال تغییر به دوربین."
+                "    ."
                 if call.arguments.get("source") == "camera"
                 and call.source_lang in ("fa", "mixed")
                 else (
-                    "در حال تغییر به صفحه نمایش."
+                    "     ."
                     if call.arguments.get("source") == "screen"
                     and call.source_lang in ("fa", "mixed")
                     else (
@@ -4693,6 +4704,8 @@ def ask_ollama_messages(
     num_predict: Optional[int] = None,
 ) -> str:
     """Isolated Ollama chat call (no conversation_history mutation) for ReAct steps."""
+    from donna.agentic import OLLAMA_UNREACHABLE_SPEECH
+
     payload = {
         "model": model,
         "messages": messages,
@@ -4707,13 +4720,12 @@ def ask_ollama_messages(
         resp = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SEC)
         resp.raise_for_status()
         data = resp.json()
-    except requests.exceptions.ConnectionError as exc:
-        raise RuntimeError(
-            "Cannot reach Ollama at http://localhost:11434. "
-            "Install from https://ollama.com and run: ollama pull llama3.2"
-        ) from exc
+    except (requests.exceptions.ConnectionError, ConnectionError) as exc:
+        raise ConnectionError(OLLAMA_UNREACHABLE_SPEECH) from exc
     except requests.exceptions.Timeout as exc:
-        raise RuntimeError(f"Ollama timed out after {OLLAMA_TIMEOUT_SEC:.0f}s") from exc
+        raise TimeoutError(
+            f"{OLLAMA_UNREACHABLE_SPEECH} (timed out after {OLLAMA_TIMEOUT_SEC:.0f}s)"
+        ) from exc
     except requests.exceptions.HTTPError as exc:
         raise RuntimeError(f"Ollama HTTP error: {exc}") from exc
 
@@ -5111,6 +5123,24 @@ def conversation_worker(
         set_ui_state("thinking")
         brain_t0 = time.perf_counter()
         try:
+            from donna.agentic import (
+                OLLAMA_UNREACHABLE_SPEECH,
+                is_ollama_connection_error,
+                ollama_service_reachable,
+            )
+
+            # Health check: fail closed with a spoken diagnosis (never silent).
+            if not ollama_service_reachable():
+                answer = OLLAMA_UNREACHABLE_SPEECH
+                log("Conversation", f'Donna: "{answer}"')
+                log_conversation("Donna", answer)
+                emit_live_transcript("Donna (Ollama)", answer)
+                enqueue_speech(answer)
+                wait_for_speech_idle(timeout=30.0)
+                time.sleep(0.15)
+                set_subtitle("")
+                return True
+
             if use_chat:
                 result = run_lightweight_chat(
                     user_text=whisper_text,
@@ -5149,16 +5179,19 @@ def conversation_worker(
                     from donna.agentic import sanitize_spoken_reply
                     from donna.settings import resolve_reply_lang
 
-                    answer = sanitize_spoken_reply(
-                        answer or "",
-                        reply_lang=resolve_reply_lang(whisper_text),
-                        tool_trace=getattr(result, "tool_trace", None),
-                    )
+                    # Keep the Ollama-down diagnosis intact for TTS.
+                    if (answer or "").strip() != OLLAMA_UNREACHABLE_SPEECH:
+                        answer = sanitize_spoken_reply(
+                            answer or "",
+                            reply_lang=resolve_reply_lang(whisper_text),
+                            tool_trace=getattr(result, "tool_trace", None),
+                        )
                 except Exception:  # noqa: BLE001
                     pass
             # ReAct history only — chat turns stay in the isolated chat buffer.
             if not isolated and not use_chat:
-                commit_agentic_turn(system_prompt, whisper_text, answer)
+                if (answer or "").strip() != OLLAMA_UNREACHABLE_SPEECH:
+                    commit_agentic_turn(system_prompt, whisper_text, answer)
             if result.tool_trace:
                 # Compact INFO tool ids; full sanitized observations only under DONNA_DEBUG.
                 tool_ids = [
@@ -5184,6 +5217,19 @@ def conversation_worker(
                 )
         except Exception as exc:  # noqa: BLE001
             log("Conversation", f"ERROR during agentic Ollama loop: {exc}")
+            try:
+                from donna.agentic import (
+                    OLLAMA_UNREACHABLE_SPEECH,
+                    is_ollama_connection_error,
+                )
+
+                if is_ollama_connection_error(exc):
+                    enqueue_speech(OLLAMA_UNREACHABLE_SPEECH)
+                    wait_for_speech_idle(timeout=30.0)
+                    set_subtitle("")
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
             return False
 
         brain_ms = (time.perf_counter() - brain_t0) * 1000.0
@@ -5629,21 +5675,16 @@ def conversation_worker(
 # Thread 5 - Audio TTS (piper-tts -> sounddevice)
 # ---------------------------------------------------------------------------
 
-def contains_farsi(text: str) -> bool:
-    """True if text includes Arabic/Persian script characters."""
-    return bool(FARSI_CHAR_RE.search(text or ""))
+def contains_non_latin_script(text: str) -> bool:
+    """Legacy helper retained for call-sites; always False (English-only release)."""
+    _ = text
+    return False
 
 
 def piper_model_path_for_text(text: str) -> str:
-    """Route Piper voice from settings language lock (English-first by default)."""
-    from donna.settings import get_assistant_language
-
-    mode = get_assistant_language()
-    if mode == "en":
-        return PIPER_EN_ONNX
-    if mode == "fa":
-        return PIPER_FA_ONNX
-    return PIPER_FA_ONNX if contains_farsi(text) else PIPER_EN_ONNX
+    """Always route Piper to the English voice (public release)."""
+    _ = text
+    return PIPER_EN_ONNX
 
 
 def get_piper_voice(model_path: str) -> PiperVoice:
@@ -6136,7 +6177,7 @@ def _synthesize_and_play(text: str, output_device: Optional[int]) -> bool:
             log_debug("TTS", f"cache play failed ({exc}); live Piper fallback")
 
     model_path = piper_model_path_for_text(text)
-    lang = "fa" if model_path == PIPER_FA_ONNX else "en"
+    lang = "en"
     t_synth0 = time.perf_counter()
     log_debug(
         "TTS",
@@ -6311,8 +6352,7 @@ def tts_worker() -> None:
 
     try:
         get_piper_voice(PIPER_EN_ONNX)
-        get_piper_voice(PIPER_FA_ONNX)
-        log("TTS", "Piper voices ready (en_US-hfc_female + fa female Taraneh/Mana).")
+        log("TTS", "Piper voice ready (en_US-hfc_female).")
     except Exception as exc:  # noqa: BLE001
         log("TTS", f"ERROR loading Piper voices: {exc}")
         stop_event.set()
@@ -6851,7 +6891,7 @@ class DonnaGUI(ctk.CTk):
 
         ctk.CTkLabel(
             tab_transcript,
-            text="Whisper STT and Ollama replies (Farsi-safe)",
+            text="Whisper STT and Ollama replies",
             anchor="w",
             text_color=("gray40", "gray65"),
         ).pack(fill="x", padx=12, pady=(12, 6))
@@ -6863,7 +6903,7 @@ class DonnaGUI(ctk.CTk):
         self.transcript_box.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.transcript_box.insert(
             "1.0",
-            "Waiting for speech… Say 'Donna', then speak in Farsi or English.\n\n",
+            "Waiting for speech… Say 'Donna', then speak.\n\n",
         )
         self.transcript_box.configure(state="disabled")
 
@@ -7228,8 +7268,7 @@ def agent_loop(args: Optional[argparse.Namespace] = None) -> int:
         log(
             "Main",
             f"Language lock: assistant={get_assistant_language()} "
-            f"whisper={get_whisper_language()} "
-            "(set assistant_language=fa in settings.json to enable Persian)",
+            f"whisper={get_whisper_language()} (English-only release)",
         )
         log(
             "Main",
@@ -7315,7 +7354,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"[Ledger] WARNING: archive_completed_tickets failed: {exc}")
 
-    # Best-effort UTF-8 stdout so Farsi logs do not crash worker threads.
+    # Best-effort UTF-8 stdout so non-ASCII logs do not crash worker threads.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
     except Exception:

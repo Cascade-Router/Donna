@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import getpass
 import json
 import os
 import queue
@@ -1938,15 +1937,20 @@ def unlock_donna_memory() -> SecureMemory:
         )
         return vault
 
-    # else: daemon locked or unreachable-with-session → prompt once
+    # else: daemon locked → resolve credential (env → keyring → TTY prompt)
+    from donna.tools.vault import VaultCredentialsMissing, _get_master_key
+
     prompt = "Enter Master Password (or pasted Recovery Key) to unlock Donna: "
     vault_exists = os.path.isfile(MEMORY_FILE)
 
+    try:
+        password = _get_master_key(prompt=prompt)
+    except VaultCredentialsMissing as exc:
+        print(f"[Memory Error] {exc}", flush=True)
+        log("Memory", f"ERROR: {exc}")
+        raise SystemExit(1) from exc
+
     if not vault_exists:
-        password = getpass.getpass(prompt)
-        if not password:
-            print("[Memory Error] Password cannot be empty.", flush=True)
-            raise SystemExit(1)
         recovery_key = secrets.token_urlsafe(32)
         try:
             donna_profile = vault_client.unlock(
@@ -1958,7 +1962,6 @@ def unlock_donna_memory() -> SecureMemory:
             raise SystemExit(1) from exc
         email_recovery_key(recovery_key)
     else:
-        password = getpass.getpass(prompt)
         try:
             donna_profile = vault_client.unlock(password, create=False)
         except Exception as exc:  # noqa: BLE001
@@ -2002,12 +2005,17 @@ def reset_donna_vault() -> None:
         log("Memory", "No vault found (--reset-vault).")
         raise SystemExit(0)
 
-    password = getpass.getpass(
-        "Enter Master Password (or Recovery Key) to authorize vault deletion: "
-    )
-    if not password:
-        print("[Security] ACCESS DENIED. Empty password.", flush=True)
-        raise SystemExit(1)
+    from donna.tools.vault import VaultCredentialsMissing, _get_master_key
+
+    try:
+        password = _get_master_key(
+            prompt=(
+                "Enter Master Password (or Recovery Key) to authorize vault deletion: "
+            )
+        )
+    except VaultCredentialsMissing as exc:
+        print(f"[Security] ACCESS DENIED. {exc}", flush=True)
+        raise SystemExit(1) from exc
 
     vault = SecureMemory()
     try:

@@ -26,6 +26,7 @@ setuptools>=70,<81
 mss==10.2.0
 requests==2.34.2
 cryptography==49.0.0
+keyring>=25.0.0
 python-dotenv==1.2.2
 pystray==0.19.5
 customtkinter==6.0.0

@@ -1,0 +1,37 @@
+# Donna / CAMGRASPER tooling config
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["."]
+extend-exclude = [".venv", "_training_archive", "tts_models"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  "E501",  # line length — large monolith / bilingual strings
+  "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"donna/core_agent.py" = ["E402", "F401"]
+"tests/test_e2e_lifecycle.py" = ["E402"]
+"verify_agentic.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+check_untyped_defs = true
+files = [
+  "donna",
+  "spatial_context.py",
+]
+
+[[tool.mypy.overrides]]
+module = "donna.core_agent"
+ignore_errors = true

@@ -1,0 +1,27 @@
+{
+  "phrase_corrections": {
+    "no it's bad": "Notepad",
+    "no its bad": "Notepad",
+    "notes pad": "Notepad",
+    "notes, bad": "Notepad",
+    "notes bad": "Notepad",
+    "note pad": "Notepad",
+    "note's pad": "Notepad",
+    "open notes pad": "open Notepad",
+    "open no it's bad": "open Notepad",
+    "open notes, bad": "open Notepad",
+    "json initiative": "Titan initiative",
+    "jason initiative": "Titan initiative",
+    "json protocol": "Titan Protocol",
+    "jason protocol": "Titan Protocol",
+    "json supervisor": "Titan supervisor",
+    "jason supervisor": "Titan supervisor",
+    "activate the json initiative": "activate the Titan initiative",
+    "activate the jason initiative": "activate the Titan initiative",
+    "start the json protocol": "start the Titan Protocol",
+    "start the jason protocol": "start the Titan Protocol",
+    "run the json initiative": "run the Titan initiative",
+    "run the jason initiative": "run the Titan initiative",
+    "vanguard protocol": "Vanguard Protocol"
+  }
+}

@@ -1,0 +1,17 @@
+"""Donna (Proposer) / Titan (Critic) asynchronous discovery loop.
+
+Internal package path: ``donna_jason_loop`` (legacy import stability).
+Decoupled from agent.py production runtime — simulation and offline discovery only.
+"""
+from __future__ import annotations
+
+__all__ = [
+    "generate_capability_pitches",
+    "evaluate_proposals",
+    "append_green_flag_to_roadmap",
+    "review_watchdog_code",
+]
+
+from donna_jason_loop.donna_proposer import generate_capability_pitches
+from donna_jason_loop.jason_critic import evaluate_proposals, review_watchdog_code
+from donna_jason_loop.ledger import append_green_flag_to_roadmap

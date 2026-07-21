@@ -1,0 +1,49 @@
+# Donna production lock — pinned for reproducible deployments.
+# Prefer CUDA wheels when an NVIDIA GPU is present:
+#   pip install torch==2.13.0+cu126 torchvision==0.28.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+#
+# Debug OS typing without injecting keystrokes:
+#   set DONNA_OS_DRY_RUN=1
+# Production default is unset / 0 (real injection).
+
+torch==2.13.0
+torchvision==0.28.0
+transformers==5.13.0
+accelerate==1.14.0
+ultralytics==8.4.91
+opencv-python==5.0.0.93
+Pillow==12.3.0
+numpy==2.5.1
+sounddevice==0.5.5
+soundfile==0.14.0
+piper-tts==1.4.2
+openwakeword==0.6.0
+onnxruntime==1.27.0
+webrtcvad==2.0.10
+# webrtcvad 2.0.10 still imports pkg_resources (removed in setuptools 81+).
+# Keep setuptools below 81 until webrtcvad migrates to importlib.metadata.
+setuptools>=70,<81
+mss==10.2.0
+requests==2.34.2
+cryptography==49.0.0
+python-dotenv==1.2.2
+pystray==0.19.5
+customtkinter==6.0.0
+psutil==7.2.2
+PyAutoGUI==0.9.54
+pywin32==312; platform_system=="Windows"
+ddgs>=9.0.0
+tzdata>=2025.1
+# Out-of-process research swarm (cloud LLM — never Ollama)
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-ollama>=0.2.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+duckduckgo-search>=6.0.0
+langchain-groq>=0.2.0
+pycaw>=20251023; platform_system=="Windows"
+comtypes>=1.4.0; platform_system=="Windows"
+# Optional: faster ToolRegistry vector search (falls back to NumPy cosine if absent)
+# faiss-cpu>=1.8.0

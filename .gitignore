@@ -1,0 +1,76 @@
+# Local Donna runtime secrets / machine config
+.env
+settings.json
+donna_memory.enc
+donna_memory.enc.tmp
+.trigger_ask
+temp_reply.wav
+vault/
+execution_jail/
+logs/
+
+# Runtime workspace secrets / local reporter config
+execution_jail/github_reporter.json
+
+# Piper offline voices (large ONNX)
+tts_models/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Repo-rooted runtime workspace (DONNA_WORKSPACE == CAMGRASPER)
+/logs/
+/tracker/
+/execution_jail/
+/custom_tools/
+/captures/
+/cursor_handoffs/
+/generated_tools/
+/dashboard.md
+.donna_workspace_migrated
+/_archive/
+.shadow_state/
+
+# Watchdog REPL scratch files (keep package + ledger docs)
+donna_security/run_*_donna_watchdog.py
+donna_security/__pycache__/
+donna_security/patch_ledger.md
+
+# Optional in-repo custom mirror (gitignored except __init__.py)
+donna/tools/custom/*
+!donna/tools/custom/__init__.py
+# General tools are tracked — do not ignore donna/tools/general/
+
+# Model weights / caches (GitHub size + local-only assets)
+*.pt
+*.onnx
+*.bin
+
+# OpenWakeWord / Piper local training clutter (regenerable via train_donna_local.py)
+audioset/
+audioset_16k/
+esc50_src/
+esc50.zip
+MIT_environmental_impulse_responses/
+mit_rirs/
+my_custom_model/
+openwakeword/
+piper-sample-generator/
+validation_set_features.npy
+my_model.yaml
+_training_archive/
+
+# Local diagnostics / harness scratch
+_e2e_*.py
+_e2e_*.json
+donna_branch_diagnostics.md
+
+donna_security/patch_ledger_archive.md
+docs/*.db
+_h1.txt
+

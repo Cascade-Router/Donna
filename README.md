@@ -1,16 +1,116 @@
-# Donna Workspace (CAMGRASPER)
+# Donna: Local-First Agentic Voice OS
 
-Repo root is the runtime workspace (`DONNA_WORKSPACE == PROJECT_ROOT`).
+**Bridge local LLMs (Llama 3.2), vision (YOLOv8), and Mixture-of-Agents reasoning (DeepSeek-R1) into a deterministic, low-latency voice operating system — with a CustomTkinter Live Trace UI that makes every graph transition observable.**
 
-| Folder | Contents |
-|--------|----------|
-| `logs/` | `donna_runtime.log`, `donna_conversation.log` |
-| `tracker/` | `bug_tracker.json`, `pending_patches/` |
-| `execution_jail/` | Filesystem jail (`task_queue.json`, `library/`, fixture copies). Not the Python package. |
-| `donna_security/` | Importable security package + `patch_ledger.md` |
-| `custom_tools/` | Sole Tool Forge write/load root (ephemeral; wiped on context reset) |
-| `cursor_handoffs/` | `donna_handoff.md` (mirrored into `.cursor/instructions/`) |
-| `captures/` | Screen captures from OS computer-use |
-| `_archive/` | Unused legacy snapshots (not loaded at runtime) |
+Donna is an offline-first agentic control plane for the desktop: wake-word perception, strict mode-isolated cognition, filesystem-jailed tool execution, and thread-safe telemetry. It is engineered as infrastructure — not a chatbot shell.
 
-Promoted tools: `donna/tools/general/` (Git-tracked). Do not merge `execution_jail/` with `donna_security/`.
+---
+
+## Key Features
+
+| Capability | Engineering win |
+|---|---|
+| **Instant Wake & JIT ML Pipeline** | OpenWakeWord on the critical path; Whisper STT and YOLOv8 load deferred in background / on Vision demand so cold start stays sub-second where it matters. |
+| **LangGraph Orchestration** | A deterministic finite-state routing fabric: lightweight **Chat** fast-path vs heavy-duty **Developer** ReAct/MoA loops — modes never share context buffers or tool jails by accident. |
+| **Live Trace UI** | Thread-safe CustomTkinter telemetry: background workers enqueue events; the Tk main thread alone mutates widgets — pipeline stages and node states render in real time. |
+| **Execution Jail & Single-Instance Lock** | Socket-bound process lock (`127.0.0.1:47473`) plus a filesystem execution jail so concurrent headless E2E runs cannot corrupt `task_queue.json` or `patch_ledger.md`. |
+
+---
+
+## Architecture at a Glance
+
+```text
+Mic / .trigger_ask / input.txt
+        │
+        ▼
+┌───────────────────┐     ┌────────────────────┐
+│  MicIngest (16k)  │────▶│  Conversation FSM  │
+│  InputIngest      │     │  (mode fast-paths) │
+└───────────────────┘     └─────────┬──────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              ▼                     ▼                     ▼
+         Chat Mode            Developer Mode         Vision / Research
+      (local llama3.2)     (MoA + ReAct tools)      (JIT YOLO / scaffold)
+              │                     │
+              └──────────┬──────────┘
+                         ▼
+              gui_telemetry_queue → Live Trace UI
+```
+
+Deep dive: [`docs/architecture.md`](docs/architecture.md) · Telemetry contract: [`docs/telemetry_and_ui.md`](docs/telemetry_and_ui.md) · Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+
+---
+
+## Quickstart
+
+**Prerequisites**
+
+- Python 3.11+ (Windows recommended for tray + Startup integration)
+- [Ollama](https://ollama.com/) with local models (e.g. `llama3.2`, `deepseek-r1:8b`)
+- PyTorch (CUDA preferred for Whisper / YOLO)
+
+**Install**
+
+```bash
+git clone https://github.com/Cascade-Router/Donna.git
+cd Donna
+python -m venv .venv
+
+# Windows
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+# Optional CUDA torch (see comments in requirements.txt)
+```
+
+**Pull models (example)**
+
+```bash
+ollama pull llama3.2
+ollama pull deepseek-r1:8b
+```
+
+**Run**
+
+```bash
+python run.py
+```
+
+First launch configures mic/speaker into `settings.json` (gitignored). Optional Windows logon autostart:
+
+```bash
+python register_startup.py
+```
+
+Open the Live Trace window from the system tray (**Open Settings**).
+
+---
+
+## Runtime Boundaries (Local State)
+
+Donna treats the repo root as the active workspace. The following are **machine-local** and excluded from Git:
+
+| Path | Role |
+|------|------|
+| `execution_jail/` | Task queue + filesystem sandbox |
+| `logs/` | Runtime / conversation logs |
+| `vault/` / `donna_memory.enc` | Encrypted profile |
+| `.env`, `settings.json` | Secrets and device IDs |
+| `*.onnx`, `*.pt`, `*.bin` | Model weights |
+
+Do not commit these. Contributors: see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+## Design Principles
+
+1. **Local-first** — cognition stays on-device via Ollama; no cloud dependency on the voice critical path.
+2. **Strict state isolation** — Chat memory never pollutes ReAct/MoA context; Chat mode refuses the tool jail.
+3. **Observable orchestration** — every meaningful stage can emit a Live Trace event without touching Tk from workers.
+4. **Fail-closed concurrency** — a second `run.py` aborts rather than racing the jail.
+
+---
+
+## License & Status
+
+Open-source release under active systems hardening. Architecture notes and UI telemetry contracts in `docs/` are the source of truth for external integrators.

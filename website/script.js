@@ -9,18 +9,19 @@
   var DOWNLOAD_BASE =
     "https://github.com/Cascade-Router/Donna/releases/latest/download";
 
+  // Filenames must match softprops upload list in .github/workflows/release.yml
   var ASSETS = {
     windows: {
       label: "Download for Windows",
-      href: DOWNLOAD_BASE + "/Donna.zip",
+      href: DOWNLOAD_BASE + "/Donna-windows-x64.zip",
     },
     macos: {
       label: "Download for Mac",
-      href: DOWNLOAD_BASE + "/Donna-macOS.dmg",
+      href: DOWNLOAD_BASE + "/Donna-macos-x64.dmg",
     },
     linux: {
       label: "Download for Linux",
-      href: DOWNLOAD_BASE + "/Donna.AppImage",
+      href: DOWNLOAD_BASE + "/Donna-linux-x86_64.AppImage",
     },
     fallback: {
       label: "View Releases",

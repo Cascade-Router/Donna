@@ -1,7 +1,7 @@
 """End-to-end lifecycle stress test for Donna agentic upgrade.
 
-Simulates: Vault daemon → wake → Farsi STT → ReAct → write_vault_memory →
-English SpatialIR synthesis → Farsi TTS, with RAM/VRAM profiling.
+Simulates: Vault daemon → wake → English STT → ReAct → write_vault_memory →
+English SpatialIR synthesis → English TTS, with RAM/VRAM profiling.
 Also covers memory conflict compaction and inject_keystrokes dry-run routing.
 """
 
@@ -146,18 +146,21 @@ def _inject_english_spatial_ir() -> str:
 
 
 def _run_react_with_vault(client: VaultClient, spatial: str, report: E2EReport) -> str:
-    """Farsi STT → ReAct → write_vault_memory → FA FINAL."""
-    user_fa = "این IP روی صفحه را یادت باشد: 10.0.0.42 و بگو چی می‌بینم."
-    SPATIAL_AGGREGATOR.update_transcript(user=user_fa)
+    """STT → ReAct → write_vault_memory → English FINAL."""
+    user_text = "Remember this IP on screen: 10.0.0.42 and tell me what you see."
+    SPATIAL_AGGREGATOR.update_transcript(user=user_text)
     system = build_agent_system_prompt(
         spatial_block=spatial,
         labels_csv="laptop, cup",
         profile_summary="{}",
-        reply_lang="fa")
+        reply_lang="en")
     scripted = [
         "TOOL: write_vault_memory(key=remembered_ip, value=10.0.0.42)",
         "TOOL: describe_spatial_scene(focus=dominant)",
-        ("FINAL: آی‌پی ۱۰.۰.۰.۴۲ را ذخیره کردم. وسط صفحه یک لپ‌تاپ می‌بینم و بالا-راست یک فنجان هست."),
+        (
+            "FINAL: Saved IP 10.0.0.42. I see a laptop in the center "
+            "and a cup at the top-right."
+        ),
     ]
     idx = {"n": 0}
 
@@ -185,7 +188,7 @@ def _run_react_with_vault(client: VaultClient, spatial: str, report: E2EReport) 
 
     _install_script(ask_fn)
     result = run_react_loop(
-        user_text=user_fa,
+        user_text=user_text,
         system_prompt=system,
         execute_fn=execute_fn,
         max_iters=REACT_MAX_ITERS,
@@ -196,17 +199,17 @@ def _run_react_with_vault(client: VaultClient, spatial: str, report: E2EReport) 
     )
     assert result.iterations <= REACT_MAX_ITERS
     assert client.read_memory("remembered_ip") == "10.0.0.42"
-    assert "لپ" in result.final_text or "فنجان" in result.final_text
+    assert "laptop" in result.final_text or "cup" in result.final_text
     return result.final_text
 
 
 def _run_memory_conflict_compaction(client: VaultClient, report: E2EReport) -> None:
     """Write conflicting project-directory facts; vault must resolve without bloat."""
-    client.write_memory("project_directory", "C:/Users/Amix/OldProject")
-    assert client.read_memory("project_directory") == "C:/Users/Amix/OldProject"
-    report.add("Conflict seed: project_directory=C:/Users/Amix/OldProject")
+    client.write_memory("project_directory", "C:/Users/Example/OldProject")
+    assert client.read_memory("project_directory") == "C:/Users/Example/OldProject"
+    report.add("Conflict seed: project_directory=C:/Users/Example/OldProject")
 
-    client.write_memory("current_project_directory", "C:/Users/Amix/Desktop/CAMGRASPER")
+    client.write_memory("current_project_directory", "C:/Users/Example/Project")
     report.add(
         "Conflict update consolidation="
         + json.dumps(client.last_consolidation, ensure_ascii=True)
@@ -215,7 +218,7 @@ def _run_memory_conflict_compaction(client: VaultClient, report: E2EReport) -> N
     profile = client.get_profile()
     assert "project_directory" not in profile
     assert memory_value(profile, "current_project_directory") == (
-        "C:/Users/Amix/Desktop/CAMGRASPER"
+        "C:/Users/Example/Project"
     )
     entry = profile["current_project_directory"]
     assert isinstance(entry, dict)
@@ -318,16 +321,16 @@ def _force_max_iter_and_gc(report: E2EReport) -> None:
         raise AssertionError(f"Possible leak: RSS grew {after - before:.1f} MB")
 
 
-def _synthesize_farsi_tts(text: str, out_wav: Path, report: E2EReport) -> None:
-    """Offline Piper FA TTS (skip gracefully if voice files missing)."""
-    project = Path(__file__).resolve().parent
-    fa_onnx = project / "tts_models" / "fa_IR-taraneh-medium.onnx"
-    if not fa_onnx.is_file():
-        report.add(f"TTS skipped (missing {fa_onnx.name})")
+def _synthesize_language_tts(text: str, out_wav: Path, report: E2EReport) -> None:
+    """Offline Piper English TTS (skip gracefully if voice files missing)."""
+    project = Path(__file__).resolve().parent.parent
+    en_onnx = project / "tts_models" / "en_US-lessac-medium.onnx"
+    if not en_onnx.is_file():
+        report.add(f"TTS skipped (missing {en_onnx.name})")
         return
     from piper import PiperVoice
 
-    voice = PiperVoice.load(str(fa_onnx))
+    voice = PiperVoice.load(str(en_onnx))
     import wave
 
     with wave.open(str(out_wav), "wb") as wf:
@@ -335,7 +338,7 @@ def _synthesize_farsi_tts(text: str, out_wav: Path, report: E2EReport) -> None:
     size = out_wav.stat().st_size
     assert size > 1000
     report.tts_wav = str(out_wav)
-    report.add(f"Farsi TTS wrote {out_wav.name} ({size} bytes)")
+    report.add(f"English TTS wrote {out_wav.name} ({size} bytes)")
 
 
 def _assert_log_sanitization() -> None:
@@ -525,7 +528,7 @@ def run_e2e() -> E2EReport:
     daemon: VaultKeyDaemon | None = None
     tmpdir = tempfile.mkdtemp(prefix="donna_e2e_")
     vault_path = os.path.join(tmpdir, "e2e_memory.enc")
-    wav_path = Path(tmpdir) / "e2e_fa.wav"
+    wav_path = Path(tmpdir) / "e2e_en.wav"
 
     try:
         _sample(report, "baseline")
@@ -560,10 +563,11 @@ def run_e2e() -> E2EReport:
         report.add(f"English SpatialIR injected: {spatial[:120]}...")
         _sample(report, "after_spatial")
 
-        final_fa = _run_react_with_vault(client, spatial, report)
-        report.final_fa = final_fa
+        final_text = _run_react_with_vault(client, spatial, report)
+        report.final_fa = final_text
         report.add(
-            "Farsi FINAL: " + final_fa[:100].encode("ascii", "backslashreplace").decode("ascii")
+            "English FINAL: "
+            + final_text[:100].encode("ascii", "backslashreplace").decode("ascii")
         )
         _sample(report, "after_react")
 
@@ -579,7 +583,7 @@ def run_e2e() -> E2EReport:
         _run_tool_synthesis(report)
         _sample(report, "after_synthesis")
 
-        _synthesize_farsi_tts(final_fa, wav_path, report)
+        _synthesize_language_tts(final_text, wav_path, report)
         _sample(report, "after_tts")
 
         _force_max_iter_and_gc(report)

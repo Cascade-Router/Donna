@@ -104,7 +104,7 @@ def test_titan_repair_graph_writes_pending_patch() -> None:
         "error": "ValueError: boom",
         "traceback": (
             'Traceback (most recent call last):\n'
-            '  File "C:/Users/Amix/Desktop/CAMGRASPER/donna/agentic.py", line 1, in <module>\n'
+            '  File "C:/Users/Example/Project/donna/agentic.py", line 1, in <module>\n'
             "    raise ValueError('boom')\n"
             "ValueError: boom"
         ),

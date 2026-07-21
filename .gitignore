@@ -15,6 +15,12 @@ execution_jail/github_reporter.json
 # Piper offline voices (large ONNX)
 tts_models/
 
+# Localization & Language assets (Incomplete features)
+*fa_IR*
+*farsi*
+*persian*
+*ticket_on_board_fa*
+
 # Python
 .venv/
 __pycache__/
@@ -69,6 +75,19 @@ _training_archive/
 _e2e_*.py
 _e2e_*.json
 donna_branch_diagnostics.md
+REPO_AUDIT.md
+
+# Debug and local testing utilities
+debug_*.py
+audio_diagnostics.py
+register_startup.py
+train_donna_local.py
+verify_agentic.py
+
+# Generated runtime reports & logs
+docs/*_report.txt
+docs/*_status.txt
+*.log
 
 donna_security/patch_ledger_archive.md
 docs/*.db

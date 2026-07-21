@@ -79,7 +79,7 @@ python run.py
 First launch configures mic/speaker into `settings.json` (gitignored). Optional Windows logon autostart:
 
 ```bash
-python register_startup.py
+python -m donna.tools.setup_startup install
 ```
 
 Open the Live Trace window from the system tray (**Open Settings**).

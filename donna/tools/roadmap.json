@@ -3,10 +3,12 @@
   "items": [],
   "deployed": [
     {
-      "proposed_id": "farsi_naming_fix",
-      "problem_statement": "Whisper STT fails to properly romanize and split Farsi household names, resulting in incomplete or incorrect transcription.",
-      "proposed_solution_code_outline": "Implement a custom post-STT regex-based fix for common Farsi naming conventions, leveraging existing Whisper-base configuration files.\nUpdate tooling to include a dictionary of known Farsi family names with correct romanization and splitting patterns.",
-      "dependencies": ["stdlib.re"],
+      "proposed_id": "naming_fix",
+      "problem_statement": "Whisper STT fails to properly romanize and split language household names, resulting in incomplete or incorrect transcription.",
+      "proposed_solution_code_outline": "Implement a custom post-STT regex-based fix for common language naming conventions, leveraging existing Whisper-base configuration files.\nUpdate tooling to include a dictionary of known language family names with correct romanization and splitting patterns.",
+      "dependencies": [
+        "stdlib.re"
+      ],
       "scores": {
         "safety": 25,
         "feasibility": 20,
@@ -16,16 +18,19 @@
       "total_score": 92,
       "flag": "green",
       "status": "deployed",
-      "module": "donna_tools/plugins/farsi_naming_fix.py",
+      "module": "donna_tools/plugins/naming_fix.py",
       "deployed_at": "2026-07-13T19:35:00+00:00",
       "round": "round1_baseline",
       "appended_at": "2026-07-13T19:27:20.975775+00:00"
     },
     {
       "proposed_id": "file_jail_enforcer",
-      "problem_statement": "Any file tool must jail to C:\\Users\\Amix\\Desktop\\CAMGRASPER\\docs, forbidding ../ traversal and absolute paths outside the jail.",
+      "problem_statement": "Any file tool must jail to ./docs, forbidding ../ traversal and absolute paths outside the jail.",
       "proposed_solution_code_outline": "Implement a jailed file access enforcer using pathlib and stdlib, ensuring all file operations adhere to directory constraints.",
-      "dependencies": ["pathlib", "pypdf"],
+      "dependencies": [
+        "pathlib",
+        "pypdf"
+      ],
       "scores": {
         "safety": 25,
         "feasibility": 22,

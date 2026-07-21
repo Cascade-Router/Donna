@@ -17,7 +17,7 @@ from donna.prompts.spatial_synthesis import build_agent_system_prompt
 
 # Irrelevant raw terminal dump — large enough to poison an LLM context window.
 CLIPBOARD_POISON = (
-    "PS C:\\Users\\Amix> Traceback (most recent call last):\n"
+    "PS C:\\Users\\Example> Traceback (most recent call last):\n"
     "  File \"donna.core_agent.py\", line 9999, in <module>\n"
     "RuntimeError: simulated kernel panic dump\n"
     "FATAL: orphaned socket 0xDEADBEEF\n"

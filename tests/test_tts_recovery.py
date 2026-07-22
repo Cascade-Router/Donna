@@ -21,7 +21,9 @@ def test_reset_tts_audio_state_releases_wake_word_gates() -> None:
     assert donna.speech_queue.empty()
     assert not donna.tts_busy.is_set()
     assert donna.speech_idle.is_set()
-    assert not donna.vad_capture_active.is_set()
+    # record_utterance may still own the mic — reset must not clear this flag.
+    assert donna.vad_capture_active.is_set()
+    donna.vad_capture_active.clear()
     print("[PASS] reset_tts_audio_state releases gates")
 
 
@@ -42,19 +44,21 @@ def test_wait_for_speech_idle_timeout_resets_state() -> None:
 
 
 def test_speak_with_timeout_aborts_hung_utterance() -> None:
-    hang = threading.Event()
-
-    def _hang_forever(_text: str, _device: object) -> bool:
-        hang.wait(timeout=5.0)
+    def _hang_until_barge(_text: str, _device: object) -> bool:
+        # Real playback exits when barge-in latches; model that here.
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline:
+            if donna.tts_interrupt_event.is_set():
+                return True
+            time.sleep(0.02)
         return False
 
     donna.tts_interrupt_event.clear()
-    with patch.object(donna, "speak_text", side_effect=_hang_forever):
+    with patch.object(donna, "_synthesize_and_play", side_effect=_hang_until_barge):
         t0 = time.perf_counter()
         interrupted = donna._speak_with_timeout("test", None, max_seconds=0.2)
         elapsed = time.perf_counter() - t0
 
-    hang.set()
     assert interrupted is True
     assert elapsed < 1.5, f"timeout wrapper too slow ({elapsed:.2f}s)"
     print(f"[PASS] _speak_with_timeout aborted hung utterance ({elapsed:.2f}s)")

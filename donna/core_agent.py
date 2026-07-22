@@ -618,6 +618,10 @@ _TTS_HOLD_FOR_VAD_MAX_S = 12.0
 tts_busy = threading.Event()
 # Barge-in: set by VAD when user speaks over TTS; checked in the playback chunk loop.
 tts_interrupt_event = threading.Event()
+# Process-wide barge-in controller (shares ``tts_interrupt_event``).
+from donna.audio.tts_worker import get_tts_worker as _get_tts_worker  # noqa: E402
+
+_tts_barge = _get_tts_worker(barge_in_event=tts_interrupt_event)
 # True while ``record_utterance`` owns the microphone (barge-in watcher must stand down).
 vad_capture_active = threading.Event()
 # Cleared until conversation_worker's Ollama warm-up finishes (gates wake-word arming).
@@ -1504,6 +1508,32 @@ def flush_speech_queue() -> int:
     return flush_tts_queue()
 
 
+def _bind_tts_barge_controller() -> None:
+    """Wire core_agent callbacks into the shared ``TtsWorker`` (idempotent)."""
+
+    def _reset_stream() -> None:
+        try:
+            from donna.agentic import reset_stream_sentence_tts
+
+            reset_stream_sentence_tts()
+        except Exception:  # noqa: BLE001
+            pass
+
+    _tts_barge.bind(
+        flush_fn=flush_tts_queue,
+        sd_stop_fn=_safe_sd_stop,
+        set_ui_fn=set_ui_state,
+        reset_stream_fn=_reset_stream,
+        busy_fn=tts_busy.is_set,
+    )
+
+
+def interrupt_tts(*, reason: str = "barge_in") -> int:
+    """Hard-stop TTS: latch barge-in, flush spool, abort PortAudio stream."""
+    _bind_tts_barge_controller()
+    return int(_tts_barge.interrupt(reason=reason, set_listening=True))
+
+
 def _wait_tts_clear_of_user_speech(text: str) -> bool:
     """Hold a dequeued phrase while VAD capture is active.
 
@@ -1545,9 +1575,13 @@ def reset_tts_audio_state(
     Without this, ``speech_idle`` stays cleared and ``tts_busy`` may remain set,
     which permanently blocks the wake-word listener.
     """
-    tts_interrupt_event.set()
-    _safe_sd_stop(where=f"reset_tts:{reason or 'unspecified'}")
-    dropped = flush_speech_queue() if flush_queue else 0
+    _bind_tts_barge_controller()
+    if flush_queue:
+        dropped = interrupt_tts(reason=f"reset:{reason or 'unspecified'}")
+    else:
+        tts_interrupt_event.set()
+        _safe_sd_stop(where=f"reset_tts:{reason or 'unspecified'}")
+        dropped = 0
     tts_busy.clear()
     speech_idle.set()
     # Do not clear vad_capture_active here — record_utterance may still own the mic.
@@ -3861,8 +3895,14 @@ def record_utterance(
             ):
                 barge_frames += 1
                 if barge_frames >= barge_need:
-                    tts_interrupt_event.set()
-                    flush_tts_queue()
+                    from donna.audio.vad_consumer import trigger_tts_barge_in
+
+                    trigger_tts_barge_in(
+                        reason=(
+                            f"vad_onset rms={frame_rms:.4f} "
+                            f"gate={barge_rms_floor:.4f}"
+                        )
+                    )
                     speech_started = True
                     collected.extend(pre_roll)
                     speech_frames = 1
@@ -5838,9 +5878,9 @@ def _play_pcm_interruptible(
     """Stream PCM to the speaker in short chunks; return True if barge-in aborted.
 
     Holds ``playback_lock`` for the OutputStream lifecycle so a second utterance
-    cannot open the device while chunks are still draining. Barge-in only sets
-    ``tts_interrupt_event``; this loop exits cleanly between chunks (no mid-write
-    ``sd.stop`` race).
+    cannot open the device while chunks are still draining. Barge-in registers
+    the live stream so ``interrupt_tts()`` can ``abort()`` without waiting on
+    this lock (avoids deferred ``sd.stop`` races).
     """
     audio = np.asarray(audio_data, dtype=np.float32)
     if audio.ndim > 1:
@@ -5849,6 +5889,7 @@ def _play_pcm_interruptible(
     if audio.size == 0:
         return False
 
+    _bind_tts_barge_controller()
     chunk = max(1, int(round(samplerate * (BARGE_IN_CHUNK_MS / 1000.0))))
     stream_kwargs: dict[str, Any] = {
         "samplerate": int(samplerate),
@@ -5876,54 +5917,65 @@ def _play_pcm_interruptible(
         )
         try:
             with sd.OutputStream(**stream_kwargs) as stream:
-                for start in range(0, audio.size, chunk):
-                    if stop_event.is_set() or tts_interrupt_event.is_set():
-                        interrupted = True
-                        log_debug(
-                            "Audio",
-                            f"playback interrupt at chunk={n_chunks} "
-                            f"offset={start}/{audio.size}",
-                        )
-                        break
-                    piece = audio[start : start + chunk]
-                    if piece.size < chunk:
-                        pad = np.zeros(chunk, dtype=np.float32)
-                        pad[: piece.size] = piece
-                        piece = pad
-                    stream.write(piece.reshape(-1, 1))
-                    n_chunks += 1
-                    bytes_written += int(piece.size) * 4
+                _tts_barge.register_output_stream(stream)
+                try:
+                    for start in range(0, audio.size, chunk):
+                        if stop_event.is_set() or _tts_barge.is_set():
+                            interrupted = True
+                            log_debug(
+                                "Audio",
+                                f"playback interrupt at chunk={n_chunks} "
+                                f"offset={start}/{audio.size}",
+                            )
+                            try:
+                                stream.abort()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            break
+                        piece = audio[start : start + chunk]
+                        if piece.size < chunk:
+                            pad = np.zeros(chunk, dtype=np.float32)
+                            pad[: piece.size] = piece
+                            piece = pad
+                        stream.write(piece.reshape(-1, 1))
+                        n_chunks += 1
+                        bytes_written += int(piece.size) * 4
+                finally:
+                    _tts_barge.unregister_output_stream(stream)
         except Exception as exc:  # noqa: BLE001
-            if _is_portaudio_error(exc):
+            if interrupted or _tts_barge.is_set():
+                interrupted = True
+            elif _is_portaudio_error(exc):
                 report_audio_hardware_fault(exc, where="OutputStream")
                 raise
-            # Fallback: start play under lock, then poll outside so barge-in can stop.
-            log(
-                "Audio",
-                f"WARNING: interruptible OutputStream failed ({exc}); using sd.play",
-            )
-            try:
-                kwargs: dict[str, Any] = {
-                    "samplerate": int(samplerate),
-                    "blocking": False,
-                }
-                if output_device is not None:
-                    kwargs["device"] = output_device
-                sd.play(audio, **kwargs)
-                used_fallback = True
-            except Exception as exc2:  # noqa: BLE001
-                if _is_portaudio_error(exc2):
-                    report_audio_hardware_fault(exc2, where="sd.play")
-                else:
-                    log_exception("Audio", "TTS Engine Failure", exc=exc2)
-                raise
+            else:
+                # Fallback: start play under lock, then poll outside so barge-in can stop.
+                log(
+                    "Audio",
+                    f"WARNING: interruptible OutputStream failed ({exc}); using sd.play",
+                )
+                try:
+                    kwargs: dict[str, Any] = {
+                        "samplerate": int(samplerate),
+                        "blocking": False,
+                    }
+                    if output_device is not None:
+                        kwargs["device"] = output_device
+                    sd.play(audio, **kwargs)
+                    used_fallback = True
+                except Exception as exc2:  # noqa: BLE001
+                    if _is_portaudio_error(exc2):
+                        report_audio_hardware_fault(exc2, where="sd.play")
+                    else:
+                        log_exception("Audio", "TTS Engine Failure", exc=exc2)
+                    raise
 
     if used_fallback and not interrupted:
         duration = audio.size / float(max(1, samplerate))
         deadline = time.perf_counter() + duration + 0.5
         log_debug("Audio", f"playback fallback sd.play duration_s={duration:.2f}")
         while time.perf_counter() < deadline:
-            if stop_event.is_set() or tts_interrupt_event.is_set():
+            if stop_event.is_set() or _tts_barge.is_set():
                 interrupted = True
                 _safe_sd_stop(where="playback_fallback_interrupt", blocking=False)
                 break
@@ -6031,11 +6083,10 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
                     "BargeIn",
                     f"Wake-word stream-barge (rms={rms:.4f}) — interrupting TTS",
                 )
-                tts_interrupt_event.set()
-                flush_tts_queue()  # dump pending system messages immediately
-                _safe_sd_stop(where="barge_wake", blocking=False)
+                from donna.audio.vad_consumer import trigger_tts_barge_in
+
+                trigger_tts_barge_in(reason=f"wake_stream rms={rms:.4f}")
                 flush_audio_buffer_queue()
-                set_ui_state("listening")
                 return
 
             if rms >= spike_floor:
@@ -6044,11 +6095,12 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
                     f"RMS spike stream-barge (rms={rms:.4f}, "
                     f"gate={spike_floor:.4f}) — interrupting TTS",
                 )
-                tts_interrupt_event.set()
-                flush_tts_queue()
-                _safe_sd_stop(where="barge_spike", blocking=False)
+                from donna.audio.vad_consumer import trigger_tts_barge_in
+
+                trigger_tts_barge_in(
+                    reason=f"rms_spike rms={rms:.4f} gate={spike_floor:.4f}"
+                )
                 flush_audio_buffer_queue()
-                set_ui_state("listening")
                 return
 
             if rms < barge_rms_floor:
@@ -6066,11 +6118,15 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
                         f"Speech onset while speaking (rms={rms:.4f}, "
                         f"gate={barge_rms_floor:.4f}) — interrupting TTS",
                     )
-                    tts_interrupt_event.set()
-                    flush_tts_queue()
-                    _safe_sd_stop(where="barge_speech", blocking=False)
+                    from donna.audio.vad_consumer import trigger_tts_barge_in
+
+                    trigger_tts_barge_in(
+                        reason=(
+                            f"speech_onset rms={rms:.4f} "
+                            f"gate={barge_rms_floor:.4f}"
+                        )
+                    )
                     flush_audio_buffer_queue()
-                    set_ui_state("listening")
                     return
             else:
                 consec = 0
@@ -6307,8 +6363,7 @@ def _speak_with_timeout(
             f"WARNING: utterance exceeded {max_seconds:.0f}s — "
             "aborting playback and releasing audio device",
         )
-        tts_interrupt_event.set()
-        _safe_sd_stop(where="utterance_timeout", blocking=False)
+        interrupt_tts(reason="utterance_timeout")
         worker.join(timeout=2.0)
         if worker.is_alive():
             log(
@@ -6397,6 +6452,7 @@ def tts_worker() -> None:
     maybe_play_boot_ready_audio()
 
     log("TTS", "spooler ready; waiting for messages (barge-in armed).")
+    _bind_tts_barge_controller()
     while not stop_event.is_set():
         try:
             try:
@@ -6408,13 +6464,21 @@ def tts_worker() -> None:
                 speech_idle.set()
                 break
 
+            # Drop orphaned spool items after a barge-in latch.
+            if _tts_barge.is_set():
+                flush_tts_queue()
+                _tts_barge.clear()
+                if tts_queue.empty() and not tts_busy.is_set():
+                    speech_idle.set()
+                continue
+
             # Hold while the user is speaking — do not overlap mic capture.
             if not _wait_tts_clear_of_user_speech(str(text)):
                 if tts_queue.empty() and not tts_busy.is_set():
                     speech_idle.set()
                 continue
 
-            tts_interrupt_event.clear()
+            _tts_barge.clear()
             tts_busy.set()
             speech_idle.clear()
             prev_ui = get_ui_state()

@@ -51,16 +51,112 @@ def _specs_for_tool_ids(
     return out
 
 
+def _invoked_tool_ids_from_messages(messages: list[Any] | None) -> set[str]:
+    """Collect tool names already invoked via AIMessage.tool_calls."""
+    invoked: set[str] = set()
+    for msg in messages or []:
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                name = str(tc.get("name") or "").strip()
+            else:
+                name = str(getattr(tc, "name", "") or "").strip()
+            if name:
+                invoked.add(name)
+    return invoked
+
+
+def pending_always_include_tools(state: dict[str, Any] | ReactGraphState) -> list[str]:
+    """always_include ids that have not yet appeared as native tool calls."""
+    always = [
+        str(x).strip()
+        for x in (state.get("always_include") or [])
+        if str(x).strip()
+    ]
+    if not always:
+        return []
+    invoked = _invoked_tool_ids_from_messages(state.get("messages") or [])
+    return [tid for tid in always if tid not in invoked]
+
+
+def _force_tool_nudge_message(tool_id: str) -> Any:
+    from langchain_core.messages import SystemMessage
+
+    tid = str(tool_id or "").strip() or "tool"
+    return SystemMessage(
+        content=(
+            f"SYSTEM: You must output the JSON tool call for `{tid}` now. "
+            "Do not answer in natural language or claim the task/ticket is complete "
+            f"until `{tid}` has executed successfully."
+        )
+    )
+
+
+def _messages_have_force_nudge(messages: list[Any] | None, tool_id: str) -> bool:
+    needle = f"JSON tool call for `{tool_id}`"
+    for msg in messages or []:
+        content = str(getattr(msg, "content", "") or "")
+        if needle in content and "SYSTEM:" in content:
+            return True
+    return False
+
+
+def _default_args_for_forced_tool(tool_id: str, user_text: str) -> dict[str, Any]:
+    """Minimal args so a programmatically forced tool call can execute."""
+    tid = str(tool_id or "").strip()
+    raw = (user_text or "").strip()
+    if tid == "analyze_visual_context":
+        return {"source": "screen"}
+    if tid == "ocr_with_region":
+        return {"query": (user_text or "").strip()[:200]}
+    if tid == "draft_cursor_prompt":
+        try:
+            from donna.tools.broker import parse_draft_cursor_prompt_args
+
+            args = dict(parse_draft_cursor_prompt_args(raw) or {})
+        except Exception:  # noqa: BLE001
+            args = {}
+        if not str(args.get("objective") or "").strip():
+            args["objective"] = raw[:500] or "Log self-improvement ticket"
+        if "context" not in args:
+            args["context"] = ""
+        return args
+    if tid in {"web_search", "dispatch_research_swarm"}:
+        return {"query": raw}
+    return {}
+
+
+def _synthetic_tool_call_message(tool_id: str, user_text: str, *, step: int) -> Any:
+    """Build an AIMessage that forces tools-node execution for ``tool_id``."""
+    from langchain_core.messages import AIMessage
+
+    tid = str(tool_id or "").strip()
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": tid,
+                "args": _default_args_for_forced_tool(tid, user_text),
+                "id": f"force-{tid}-{step}-{uuid.uuid4().hex[:8]}",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
 def _route_after_agent(state: ReactGraphState) -> str:
-    """Conditional edge: agent → tools (tool_calls) or END (halt / final)."""
+    """Conditional edge: agent → tools / agent (pending always_include) / END."""
     from langgraph.graph import END
 
-    if state.get("halt"):
-        return END
     messages = state.get("messages") or []
     last = messages[-1] if messages else None
     if last is not None and getattr(last, "tool_calls", None):
         return "tools"
+    # Option B: do not END while broker-merged tools remain uninvoked.
+    if pending_always_include_tools(state):
+        return "agent"
+    if state.get("halt"):
+        return END
     return END
 
 
@@ -68,6 +164,10 @@ def _route_after_tools(state: ReactGraphState) -> str:
     """Conditional edge: tools → END (halt) or agent (continue ReAct)."""
     from langgraph.graph import END
 
+    if state.get("halt") and not pending_always_include_tools(state):
+        return END
+    if pending_always_include_tools(state):
+        return "agent"
     return END if state.get("halt") else "agent"
 
 
@@ -81,6 +181,7 @@ def compile_donna_react_graph(
 
     Topology:
       START → agent ─(tool_calls)→ tools ─(continue)→ agent
+                    ╲(pending always_include / nudge)→ agent
                     ╲(halt/final)→ END          ╲(halt)→ END
     """
     from langgraph.graph import END, START, StateGraph
@@ -94,7 +195,7 @@ def compile_donna_react_graph(
     workflow.add_conditional_edges(
         "agent",
         _route_after_agent,
-        {"tools": "tools", END: END},
+        {"tools": "tools", "agent": "agent", END: END},
     )
     workflow.add_conditional_edges(
         "tools",
@@ -152,6 +253,8 @@ async def run_react_langgraph(
         prompt = f"{prompt}\n\n{ag._TOOL_EXECUTION_RULE}"
     if ag._STRICT_TOOL_ENFORCEMENT_RULE not in prompt:
         prompt = f"{prompt}\n\n{ag._STRICT_TOOL_ENFORCEMENT_RULE}"
+    if ag._EXPLICIT_TOOL_INVOCATION_RULE not in prompt:
+        prompt = f"{prompt}\n\n{ag._EXPLICIT_TOOL_INVOCATION_RULE}"
     if ag._R1_REASONING_RULE not in prompt:
         prompt = f"{prompt}\n\n{ag._R1_REASONING_RULE}"
     if ag._VOICE_SANITIZER_RULE not in prompt:
@@ -596,6 +699,27 @@ async def run_react_langgraph(
             except Exception:
                 pass
 
+    def _try_bind_tool_choice(tool_id: str) -> bool:
+        """Option A: ask the provider to force the next native tool call."""
+        nonlocal llm_with_tools
+        tid = str(tool_id or "").strip()
+        if not tid:
+            return False
+        try:
+            llm_with_tools = llm.bind_tools(tools, tool_choice=tid, strict=True)
+            return True
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            llm_with_tools = llm.bind_tools(
+                tools,
+                tool_choice={"type": "function", "function": {"name": tid}},
+                strict=True,
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def _agent_node(state: ReactGraphState) -> dict[str, Any]:
         nonlocal llm_with_tools, last_obs, tts_streamed
         messages = list(state.get("messages") or [])
@@ -608,6 +732,37 @@ async def run_react_langgraph(
         ]
         if state_always:
             _rebind_from_always(state_always)
+        pending_start = [
+            tid
+            for tid in state_always
+            if tid not in _invoked_tool_ids_from_messages(messages)
+        ]
+        # After a prior Option-B nudge, skip another prose turn and synthesize
+        # the missing tool call (8B models ignore prompt-only CRITICAL rules).
+        if pending_start and _messages_have_force_nudge(messages, pending_start[0]):
+            forced_msg = _synthetic_tool_call_message(
+                pending_start[0], user_text, step=step
+            )
+            _emit_live_trace(
+                "node_enter",
+                node="agent",
+                message=(
+                    f"Forced tool call for pending always_include "
+                    f"`{pending_start[0]}` (step {step})"
+                ),
+                mode=ag.get_donna_mode(),
+                state_keys=("messages", "iterations", "always_include"),
+            )
+            return {
+                "messages": [forced_msg],
+                "iterations": step,
+                "last_obs": last_obs,
+                "final_raw": "",
+                "halt": False,
+                "always_include": list(state_always or always),
+            }
+        if pending_start:
+            _try_bind_tool_choice(pending_start[0])
         _emit_live_trace(
             "node_enter",
             node="agent",
@@ -770,6 +925,7 @@ async def run_react_langgraph(
                     tool_calls = [recovered]
                     response = AIMessage(content="", tool_calls=tool_calls)
 
+        always_list = list(state.get("always_include") or always)
         if tool_calls:
             return {
                 "messages": [response],
@@ -777,7 +933,45 @@ async def run_react_langgraph(
                 "last_obs": last_obs,
                 "final_raw": "",
                 "halt": False,
-                "always_include": list(state.get("always_include") or always),
+                "always_include": always_list,
+            }
+
+        # Option B: text-only reply while always_include tools remain → nudge
+        # (or synthesize after nudge / max iters) instead of exiting to END.
+        pending_after = [
+            tid
+            for tid in always_list
+            if tid
+            not in _invoked_tool_ids_from_messages(
+                list(messages) + [response]
+            )
+        ]
+        if pending_after:
+            next_tid = pending_after[0]
+            if (
+                _messages_have_force_nudge(messages, next_tid)
+                or step >= max_iters
+            ):
+                forced_msg = _synthetic_tool_call_message(
+                    next_tid, user_text, step=step
+                )
+                return {
+                    "messages": [response, forced_msg],
+                    "iterations": step,
+                    "last_obs": last_obs,
+                    "final_raw": "",
+                    "halt": False,
+                    "always_include": always_list,
+                }
+            _try_bind_tool_choice(next_tid)
+            nudge = _force_tool_nudge_message(next_tid)
+            return {
+                "messages": [response, nudge],
+                "iterations": step,
+                "last_obs": last_obs,
+                "final_raw": "",
+                "halt": False,
+                "always_include": always_list,
             }
 
         raw = raw_stripped
@@ -813,7 +1007,7 @@ async def run_react_langgraph(
             "last_obs": last_obs,
             "final_raw": answer,
             "halt": True,
-            "always_include": list(state.get("always_include") or always),
+            "always_include": always_list,
         }
 
     async def _tools_node(state: ReactGraphState) -> dict[str, Any]:
@@ -886,6 +1080,16 @@ async def run_react_langgraph(
                     if src == "camera":
                         src = "webcam"
                     observation = str(_analyze_visual(source=src))
+                elif tool_call.tool_id == "ocr_with_region":
+                    from donna.tools.visual_tools import ocr_with_region as _ocr_region
+
+                    observation = str(
+                        _ocr_region(
+                            query=str(
+                                (tool_call.arguments or {}).get("query") or ""
+                            ).strip()
+                        )
+                    )
                 else:
                     tool_map = {getattr(t, "name", ""): t for t in tools}
                     st = tool_map.get(tool_call.tool_id)

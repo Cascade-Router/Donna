@@ -4221,6 +4221,13 @@ def execute_tool_call(tc: ToolCall) -> str:
             source = "webcam"
         return analyze_visual_context(source=source)
 
+    def _handle_ocr_with_region(call: ToolCall) -> str:
+        """Florence-2 OCR grounding → text + ROI overlay highlight."""
+        from donna.tools.visual_tools import ocr_with_region
+
+        query = str(call.arguments.get("query") or "").strip()
+        return ocr_with_region(query=query)
+
     def _handle_describe_spatial(call: ToolCall) -> str:
         # Prefer live JIT YOLO payload; keep SpatialIR as secondary context.
         from donna.vision_tools import analyze_visual_context
@@ -4697,6 +4704,7 @@ def execute_tool_call(tc: ToolCall) -> str:
     handlers = {
         "switch_vision_source": _handle_switch_vision,
         "analyze_visual_context": _handle_analyze_visual,
+        "ocr_with_region": _handle_ocr_with_region,
         "describe_spatial_scene": _handle_describe_spatial,
         "read_vault_memory": _handle_read_vault,
         "write_vault_memory": _handle_write_vault,

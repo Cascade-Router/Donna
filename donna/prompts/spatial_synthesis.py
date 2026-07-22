@@ -233,6 +233,8 @@ VISION TOOL GUARDRAIL: You are STRICTLY FORBIDDEN from calling `switch_vision_so
 
 Available tools (bound natively — call by id):
 - analyze_visual_context(source=screen|webcam)  # JIT YOLOv8 screen/webcam detection
+- ocr_with_region(query?)  # Florence-2 OCR + region grounding; highlights text on ROI overlay
+When the user asks to read on-screen text, find a button/label, or ground UI elements, call `ocr_with_region` (not YOLO-only analyze). Speak a natural summary of the OCR focus text — never invent glyphs.
 - switch_vision_source(source=screen|camera)
 - read_vault_memory(key=<profile_key>)
 - write_vault_memory(key=<profile_key>, value=<text>)

@@ -247,6 +247,22 @@ _WEBCAM_HINT_RE = re.compile(
     r"\b(?:webcam|camera|look at me|on camera)\b",
     re.IGNORECASE,
 )
+# Florence-2 OCR / UI grounding (read text, find buttons, terminal traceback).
+_OCR_GROUND_HINT_RE = re.compile(
+    r"\b("
+    r"ocr|"
+    r"read\s+the\s+text|"
+    r"read\s+(?:my\s+)?(?:the\s+)?terminal|"
+    r"text\s+in\s+(?:my\s+)?(?:the\s+)?terminal|"
+    r"traceback|"
+    r"where\s+is\s+the\s+\w[\w\s-]{0,40}button|"
+    r"find\s+the\s+\w[\w\s-]{0,40}button|"
+    r"submit\s+button|"
+    r"ground(?:ing)?\s+(?:the\s+)?(?:text|ui|button|label)|"
+    r"what\s+does\s+(?:the|this)\s+(?:button|label|dialog)\s+say"
+    r")\b",
+    re.IGNORECASE,
+)
 # Explicit project-directory listing requests must not drift into read_local_file
 # or describe_spatial_scene.
 _PROJECT_LIST_RE = re.compile(
@@ -413,6 +429,7 @@ def merge_bound_tool_ids(
     Vision mode keeps ``analyze_visual_context`` bound (JIT vision path) while
     any tool id spelled in the raw prompt is appended so mode overrides cannot
     starve an explicit request (e.g. ``draft_cursor_prompt``).
+    OCR/grounding prompts also keep ``ocr_with_region`` (Florence-2) bound.
     """
     if known_ids is None:
         try:
@@ -432,6 +449,8 @@ def merge_bound_tool_ids(
     _add(forced_tool_id)
     if (mode or "").strip().lower() == "vision":
         _add("analyze_visual_context")
+        if _OCR_GROUND_HINT_RE.search(user_text or ""):
+            _add("ocr_with_region")
     for tid in explicit_tool_ids_in_text(user_text, known):
         _add(tid)
     return merged
@@ -548,8 +567,9 @@ class IntentBroker:
     def augment_system_prompt(self, system_prompt: str, user_text: str) -> str:
         """Prepend matched lessons_learned into the system prompt.
 
-        Also injects TOOL_EXECUTION, STRICT_TOOL_ENFORCEMENT, R1_REASONING,
-        VOICE_SANITIZER, INTERACTION_UX, TECHNICAL PRODUCT MANAGER, and TERMINATION.
+        Also injects TOOL_EXECUTION, STRICT_TOOL_ENFORCEMENT, explicit-tool CRITICAL,
+        R1_REASONING, VOICE_SANITIZER, INTERACTION_UX, TECHNICAL PRODUCT MANAGER,
+        and TERMINATION.
         """
         tool_exec = (
             "TOOL_EXECUTION_RULE: You are an autonomous agent, not a conversational "
@@ -570,6 +590,12 @@ class IntentBroker:
             "the solution, you MUST include that command INSIDE the 'context' "
             "argument of the `draft_cursor_prompt` tool, not as plain text in your "
             "response. If you do not call the tool, you have failed the task."
+        )
+        explicit_tool = (
+            "CRITICAL: If the user explicitly asks to use a tool (e.g., draft_cursor_prompt), "
+            "you MUST invoke that tool's JSON schema in your response before outputting a "
+            "final natural language answer. Do not claim a task or ticket has been logged "
+            "unless the tool execution trace confirms it."
         )
         r1 = (
             "R1_REASONING_RULE: You are a reasoning model. You MUST use your "
@@ -620,6 +646,8 @@ class IntentBroker:
             prompt = f"{prompt}\n\n{tool_exec}"
         if strict_tool not in prompt:
             prompt = f"{prompt}\n\n{strict_tool}"
+        if explicit_tool not in prompt:
+            prompt = f"{prompt}\n\n{explicit_tool}"
         if r1 not in prompt:
             prompt = f"{prompt}\n\n{r1}"
         if voice not in prompt:
@@ -774,6 +802,25 @@ class IntentBroker:
                 source_lang=lang,
                 raw_text=raw,
                 confidence=0.96,
+            )
+        # Florence-2 OCR / UI grounding before generic YOLO visual look/see.
+        ocr_hit = bool(_OCR_GROUND_HINT_RE.search(raw))
+        if ocr_hit and not mem_write_hit:
+            q = ""
+            m = re.search(
+                r"(?:where\s+is|find|locate|read)\s+(?:the\s+)?(.+?)(?:\s+on\s+(?:my\s+)?screen)?\s*$",
+                raw,
+                flags=re.I,
+            )
+            if m:
+                q = m.group(1).strip(" ?.!,")
+            _foresight_cascade(raw, "ocr_with_region")
+            return ToolCall(
+                tool_id="ocr_with_region",
+                arguments={"query": q} if q else {},
+                source_lang=lang,
+                raw_text=raw,
+                confidence=0.97,
             )
         # Visual look/see → JIT YOLO analyze_visual_context (bound in LangGraph).
         if visual_hit and not mem_write_hit:

@@ -1,4 +1,4 @@
-"""Vision helpers (ROI overlay + Tracker buffer consumers)."""
+"""Vision helpers (ROI overlay, Florence-2 OCR, Tracker buffer consumers)."""
 
 from __future__ import annotations
 

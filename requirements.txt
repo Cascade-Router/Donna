@@ -8,8 +8,12 @@
 
 torch==2.13.0
 torchvision==0.28.0
+# Silero hubconf imports torchaudio (PyPI may lag torch CUDA pins).
+torchaudio>=2.5.0
 transformers==5.13.0
 accelerate==1.14.0
+einops>=0.8.0
+timm>=1.0.0
 ultralytics==8.4.91
 opencv-python==5.0.0.93
 Pillow==12.3.0
@@ -19,9 +23,7 @@ soundfile==0.14.0
 piper-tts==1.4.2
 openwakeword==0.6.0
 onnxruntime==1.27.0
-webrtcvad==2.0.10
-# webrtcvad 2.0.10 still imports pkg_resources (removed in setuptools 81+).
-# Keep setuptools below 81 until webrtcvad migrates to importlib.metadata.
+# Silero VAD loads via torch.hub (snakers4/silero-vad); no webrtcvad.
 setuptools>=70,<81
 mss==10.2.0
 requests==2.34.2

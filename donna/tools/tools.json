@@ -99,6 +99,33 @@
       }
     },
     {
+      "id": "ocr_with_region",
+      "description_en": "Florence-2 OCR with region grounding: read on-screen text (terminals, buttons, UI labels) from the Tracker rolling frame buffer, return text + boxes, and highlight the match on the live ROI overlay. Use when the user asks to read text, find a button, locate a label, or ground UI elements.",
+      "parameters": [
+        {
+          "name": "query",
+          "type": "string",
+          "required": false,
+          "description_en": "Optional text or UI label to find (e.g. 'Submit', 'traceback'). Empty = report all OCR regions and focus the largest.",
+          "description_fa": ""
+        }
+      ],
+      "aliases_en": {
+        "query": [
+          "read the text",
+          "read my terminal",
+          "ocr",
+          "where is the submit button",
+          "find the button",
+          "ground the text",
+          "read the traceback"
+        ]
+      },
+      "aliases_fa": {
+        "query": []
+      }
+    },
+    {
       "id": "describe_spatial_scene",
       "description_en": "VISION ONLY. Answer what the user is looking at using YOLO spatial context. NEVER use for files, projects, directories, memory, vault keys, code, or documents — use read_local_file / run_terminal_command / read_vault_memory instead.",
       "parameters": [

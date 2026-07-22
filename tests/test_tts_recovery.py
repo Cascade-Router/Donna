@@ -44,7 +44,7 @@ def test_wait_for_speech_idle_timeout_resets_state() -> None:
 
 
 def test_speak_with_timeout_aborts_hung_utterance() -> None:
-    def _hang_until_barge(_text: str, _device: object) -> bool:
+    def _hang_until_barge(_text: str, _device: object, **_kwargs: object) -> bool:
         # Real playback exits when barge-in latches; model that here.
         deadline = time.perf_counter() + 5.0
         while time.perf_counter() < deadline:

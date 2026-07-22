@@ -16,8 +16,10 @@ from donna.audio.vad_consumer import trigger_tts_barge_in
 def test_interrupt_flushes_queue_and_sets_event() -> None:
     donna._bind_tts_barge_controller()
     donna.tts_interrupt_event.clear()
-    donna.speech_queue.put_nowait("chunk-a")
-    donna.speech_queue.put_nowait("chunk-b")
+    donna._tts_barge.end_playback()
+    donna._tts_barge.begin_playback(interruptible=True)
+    donna.speech_queue.put_nowait(("chunk-a", True))
+    donna.speech_queue.put_nowait(("chunk-b", True))
     donna.tts_busy.set()
 
     dropped = trigger_tts_barge_in(reason="unit-test")
@@ -25,7 +27,26 @@ def test_interrupt_flushes_queue_and_sets_event() -> None:
     assert donna.tts_interrupt_event.is_set()
     assert dropped >= 2
     assert donna.speech_queue.empty()
+    donna._tts_barge.end_playback()
     print("[PASS] interrupt flushes spool + latches barge-in event")
+
+
+def test_uninterruptible_ux_ack_ignores_barge_in() -> None:
+    donna._bind_tts_barge_controller()
+    donna.tts_interrupt_event.clear()
+    donna.speech_queue.put_nowait(("Yes?", False))
+    donna._tts_barge.begin_playback(interruptible=False)
+    donna.tts_busy.set()
+
+    dropped = trigger_tts_barge_in(reason="self-bleed")
+
+    assert dropped == 0
+    assert not donna.tts_interrupt_event.is_set()
+    assert not donna.speech_queue.empty()
+    donna._tts_barge.end_playback()
+    donna.flush_tts_queue()
+    donna.tts_busy.clear()
+    print("[PASS] uninterruptible UX ack ignores barge-in")
 
 
 def test_tts_worker_skips_chunk_when_barge_latched() -> None:

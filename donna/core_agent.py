@@ -602,8 +602,9 @@ subtitle_text = ""
 injected_question_lock = threading.Lock()
 injected_question: Optional[str] = None
 
-# TTS Output Spooler — producers push strings; one consumer owns PortAudio out.
-tts_queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=16)
+# TTS Output Spooler — producers push (text, interruptible); consumer owns PortAudio.
+# ``interruptible=False`` = UI ack exemption (no self-barge-in on speaker bleed).
+tts_queue: queue.Queue[Optional[tuple[str, bool]]] = queue.Queue(maxsize=16)
 speech_queue = tts_queue  # backward-compatible alias
 # Serialize TTS enqueue / flush mutations.
 _tts_enqueue_lock = threading.Lock()
@@ -1451,11 +1452,15 @@ def _safe_sd_stop(*, where: str = "", blocking: bool = True) -> None:
             playback_lock.release()
 
 
-def enqueue_speech(text: str) -> None:
+def enqueue_speech(text: str, *, interruptible: bool | None = None) -> None:
     """Producer API: push text into the TTS spooler and return immediately.
 
     Never opens PortAudio or blocks on Piper — the ``tts_worker`` owns playback.
     Caps pending phrases while busy so stream handlers cannot hammer the device.
+
+    ``interruptible=False`` marks UI acknowledgments (wake "Yes?", mode acks) so
+    VAD/wake barge-in cannot cut them (Apple-style self-barge exemption).
+    When omitted, canned UX cache hits default to uninterruptible.
     """
     text = sanitize_text_for_tts(text or "")
     with _tts_enqueue_lock:
@@ -1463,6 +1468,12 @@ def enqueue_speech(text: str) -> None:
             if tts_queue.empty() and not tts_busy.is_set():
                 speech_idle.set()
             return
+        if interruptible is None:
+            # Canned UX WAVs (Yes?, mode active, …) are uninterruptible by default.
+            try:
+                interruptible = canned_ux_cache_path(text) is None
+            except Exception:  # noqa: BLE001
+                interruptible = True
         speech_idle.clear()
         pending = tts_queue.qsize()
         if tts_busy.is_set() and pending >= _SPEECH_MAX_PENDING_WHILE_BUSY:
@@ -1472,10 +1483,11 @@ def enqueue_speech(text: str) -> None:
             )
             return
         try:
-            tts_queue.put_nowait(text)
+            tts_queue.put_nowait((text, bool(interruptible)))
             log_debug(
                 "TTS",
-                f"spooled chars={len(text)} pending={tts_queue.qsize()} "
+                f"spooled chars={len(text)} interruptible={bool(interruptible)} "
+                f"pending={tts_queue.qsize()} "
                 f"busy={tts_busy.is_set()} vad={vad_capture_active.is_set()}",
             )
         except queue.Full:
@@ -1485,6 +1497,15 @@ def enqueue_speech(text: str) -> None:
             )
             if tts_queue.empty() and not tts_busy.is_set():
                 speech_idle.set()
+
+
+def _parse_tts_spool_item(item: Any) -> tuple[str, bool]:
+    """Normalize queue items to ``(text, interruptible)``."""
+    if isinstance(item, tuple) and item:
+        text = str(item[0] or "")
+        flag = bool(item[1]) if len(item) > 1 else True
+        return text, flag
+    return str(item or ""), True
 
 
 def flush_tts_queue() -> int:
@@ -1528,10 +1549,12 @@ def _bind_tts_barge_controller() -> None:
     )
 
 
-def interrupt_tts(*, reason: str = "barge_in") -> int:
+def interrupt_tts(*, reason: str = "barge_in", force: bool = False) -> int:
     """Hard-stop TTS: latch barge-in, flush spool, abort PortAudio stream."""
     _bind_tts_barge_controller()
-    return int(_tts_barge.interrupt(reason=reason, set_listening=True))
+    return int(
+        _tts_barge.interrupt(reason=reason, set_listening=True, force=force)
+    )
 
 
 def _wait_tts_clear_of_user_speech(text: str) -> bool:
@@ -1700,7 +1723,8 @@ def speak_tool_working_ack(call: ToolCall, reply_lang: str) -> None:
     log_debug("Conversation", f'Tool working ack ({tool_id}): "{phrase}"')
     set_subtitle(phrase)
     # Fire-and-forget so Piper plays while Ollama / web_search run on this thread.
-    enqueue_speech(phrase)
+    # Short filler acks are uninterruptible (avoid self-barge from speaker bleed).
+    enqueue_speech(phrase, interruptible=False)
 
 
 def spatial_zone(cx: float, cy: float, frame_w: int = FRAME_SIZE[0], frame_h: int = FRAME_SIZE[1]) -> str:
@@ -3887,12 +3911,16 @@ def record_utterance(
 
             # Barge-in: user talks over Donna → cut TTS and start capturing now.
             # Adaptive floor filters speaker bleed that used to trip at ~0.05–0.10.
+            # UI acknowledgments (Yes?, mode acks) are uninterruptible — ignore onset.
             if (
                 tts_busy.is_set()
                 and get_ui_state() == "speaking"
                 and is_speech
                 and frame_rms >= barge_rms_floor
             ):
+                if not _tts_barge.is_playback_interruptible():
+                    barge_frames = 0
+                    return False
                 barge_frames += 1
                 if barge_frames >= barge_need:
                     from donna.audio.vad_consumer import trigger_tts_barge_in
@@ -5071,7 +5099,7 @@ def conversation_worker(
             log_conversation("Donna", ack)
             emit_live_transcript("User (Whisper)", whisper_text or "")
             emit_live_transcript("Donna", ack)
-            enqueue_speech(ack)
+            enqueue_speech(ack, interruptible=False)
             wait_for_speech_idle(timeout=8.0)
             set_subtitle("")
             return True
@@ -5366,7 +5394,7 @@ def conversation_worker(
                 set_subtitle(f'User (Queue): "{command}"')
                 emit_live_transcript("User (TaskQueue)", command)
                 if is_standby_command(command):
-                    enqueue_speech("Standing by.")
+                    enqueue_speech("Standing by.", interruptible=False)
                     wait_for_speech_idle(timeout=8.0)
                     return
                 if is_clear_context_command(command):
@@ -5511,7 +5539,7 @@ def conversation_worker(
                     # Initial wake turn: ack on audio_worker; open VAD immediately
                     # (do not wait for TTS — onset ignored while tts_busy).
                     log("Conversation", 'Acknowledging wake -> "Yes?" (non-blocking TTS)')
-                    enqueue_speech("Yes?")
+                    enqueue_speech("Yes?", interruptible=False)
                     set_ui_state("listening")
                     try:
                         audio, rms_raw, stop_reason, speech_started = record_utterance(
@@ -5542,7 +5570,7 @@ def conversation_worker(
                             "No VAD onset after wake — re-listening once "
                             f"(rms_raw={rms_raw:.5f}, reason={stop_reason})",
                         )
-                        enqueue_speech("I'm here.")
+                        enqueue_speech("I'm here.", interruptible=False)
                         wait_for_speech_idle(timeout=8.0)
                         follow_up = True
                         set_ui_state("followup")
@@ -5553,7 +5581,7 @@ def conversation_worker(
                             f"Wake capture too quiet for STT (rms_raw={rms_raw:.5f}) "
                             "— re-listening once",
                         )
-                        enqueue_speech("I'm here.")
+                        enqueue_speech("I'm here.", interruptible=False)
                         wait_for_speech_idle(timeout=8.0)
                         follow_up = True
                         set_ui_state("followup")
@@ -5636,7 +5664,7 @@ def conversation_worker(
                     # Stay in-session and re-listen once — don't drop to idle
                     # before the user can retry (also restores "Let me check" path).
                     if not follow_up:
-                        enqueue_speech("Sorry — say that again.")
+                        enqueue_speech("Sorry — say that again.", interruptible=False)
                         wait_for_speech_idle(timeout=8.0)
                         follow_up = True
                         set_ui_state("followup")
@@ -5874,6 +5902,8 @@ def _play_pcm_interruptible(
     audio_data: np.ndarray,
     samplerate: int,
     output_device: Optional[int],
+    *,
+    interruptible: bool = True,
 ) -> bool:
     """Stream PCM to the speaker in short chunks; return True if barge-in aborted.
 
@@ -5881,6 +5911,8 @@ def _play_pcm_interruptible(
     cannot open the device while chunks are still draining. Barge-in registers
     the live stream so ``interrupt_tts()`` can ``abort()`` without waiting on
     this lock (avoids deferred ``sd.stop`` races).
+
+    ``interruptible=False`` plays UI acknowledgments without arming barge-in.
     """
     audio = np.asarray(audio_data, dtype=np.float32)
     if audio.ndim > 1:
@@ -5908,84 +5940,102 @@ def _play_pcm_interruptible(
     log_debug(
         "Audio",
         f"playback alloc samples={audio.size} sr={samplerate} "
-        f"chunk={chunk} ({BARGE_IN_CHUNK_MS:.0f}ms) device={output_device}",
+        f"chunk={chunk} ({BARGE_IN_CHUNK_MS:.0f}ms) device={output_device} "
+        f"interruptible={interruptible}",
     )
-    with playback_lock:
-        log_debug(
-            "Audio",
-            f"playback start t={t_start:.3f} samples={audio.size}",
-        )
-        try:
-            with sd.OutputStream(**stream_kwargs) as stream:
-                _tts_barge.register_output_stream(stream)
-                try:
-                    for start in range(0, audio.size, chunk):
-                        if stop_event.is_set() or _tts_barge.is_set():
-                            interrupted = True
-                            log_debug(
-                                "Audio",
-                                f"playback interrupt at chunk={n_chunks} "
-                                f"offset={start}/{audio.size}",
-                            )
-                            try:
-                                stream.abort()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            break
-                        piece = audio[start : start + chunk]
-                        if piece.size < chunk:
-                            pad = np.zeros(chunk, dtype=np.float32)
-                            pad[: piece.size] = piece
-                            piece = pad
-                        stream.write(piece.reshape(-1, 1))
-                        n_chunks += 1
-                        bytes_written += int(piece.size) * 4
-                finally:
-                    _tts_barge.unregister_output_stream(stream)
-        except Exception as exc:  # noqa: BLE001
-            if interrupted or _tts_barge.is_set():
-                interrupted = True
-            elif _is_portaudio_error(exc):
-                report_audio_hardware_fault(exc, where="OutputStream")
-                raise
-            else:
-                # Fallback: start play under lock, then poll outside so barge-in can stop.
-                log(
-                    "Audio",
-                    f"WARNING: interruptible OutputStream failed ({exc}); using sd.play",
-                )
-                try:
-                    kwargs: dict[str, Any] = {
-                        "samplerate": int(samplerate),
-                        "blocking": False,
-                    }
-                    if output_device is not None:
-                        kwargs["device"] = output_device
-                    sd.play(audio, **kwargs)
-                    used_fallback = True
-                except Exception as exc2:  # noqa: BLE001
-                    if _is_portaudio_error(exc2):
-                        report_audio_hardware_fault(exc2, where="sd.play")
-                    else:
-                        log_exception("Audio", "TTS Engine Failure", exc=exc2)
-                    raise
-
-    if used_fallback and not interrupted:
-        duration = audio.size / float(max(1, samplerate))
-        deadline = time.perf_counter() + duration + 0.5
-        log_debug("Audio", f"playback fallback sd.play duration_s={duration:.2f}")
-        while time.perf_counter() < deadline:
-            if stop_event.is_set() or _tts_barge.is_set():
-                interrupted = True
-                _safe_sd_stop(where="playback_fallback_interrupt", blocking=False)
-                break
-            time.sleep(0.03)
-        else:
+    # Honor the turn-level latch when the spooler already called begin_playback;
+    # otherwise (unit tests / direct play) open a local session.
+    owns_session = not _tts_barge.is_playback_active()
+    if owns_session:
+        _tts_barge.begin_playback(interruptible=interruptible)
+    try:
+        with playback_lock:
+            log_debug(
+                "Audio",
+                f"playback start t={t_start:.3f} samples={audio.size}",
+            )
             try:
-                with playback_lock:
-                    sd.wait()
-            except Exception:
-                pass
+                with sd.OutputStream(**stream_kwargs) as stream:
+                    if interruptible:
+                        _tts_barge.register_output_stream(stream)
+                    try:
+                        for start in range(0, audio.size, chunk):
+                            if stop_event.is_set():
+                                interrupted = True
+                                break
+                            if interruptible and _tts_barge.is_set():
+                                interrupted = True
+                                log_debug(
+                                    "Audio",
+                                    f"playback interrupt at chunk={n_chunks} "
+                                    f"offset={start}/{audio.size}",
+                                )
+                                try:
+                                    stream.abort()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                break
+                            piece = audio[start : start + chunk]
+                            if piece.size < chunk:
+                                pad = np.zeros(chunk, dtype=np.float32)
+                                pad[: piece.size] = piece
+                                piece = pad
+                            stream.write(piece.reshape(-1, 1))
+                            n_chunks += 1
+                            bytes_written += int(piece.size) * 4
+                    finally:
+                        if interruptible:
+                            _tts_barge.unregister_output_stream(stream)
+            except Exception as exc:  # noqa: BLE001
+                if interrupted or (interruptible and _tts_barge.is_set()):
+                    interrupted = True
+                elif _is_portaudio_error(exc):
+                    report_audio_hardware_fault(exc, where="OutputStream")
+                    raise
+                else:
+                    # Fallback: start play under lock, then poll outside so barge-in can stop.
+                    log(
+                        "Audio",
+                        f"WARNING: interruptible OutputStream failed ({exc}); using sd.play",
+                    )
+                    try:
+                        kwargs: dict[str, Any] = {
+                            "samplerate": int(samplerate),
+                            "blocking": False,
+                        }
+                        if output_device is not None:
+                            kwargs["device"] = output_device
+                        sd.play(audio, **kwargs)
+                        used_fallback = True
+                    except Exception as exc2:  # noqa: BLE001
+                        if _is_portaudio_error(exc2):
+                            report_audio_hardware_fault(exc2, where="sd.play")
+                        else:
+                            log_exception("Audio", "TTS Engine Failure", exc=exc2)
+                        raise
+
+        if used_fallback and not interrupted:
+            duration = audio.size / float(max(1, samplerate))
+            deadline = time.perf_counter() + duration + 0.5
+            log_debug("Audio", f"playback fallback sd.play duration_s={duration:.2f}")
+            while time.perf_counter() < deadline:
+                if stop_event.is_set():
+                    interrupted = True
+                    break
+                if interruptible and _tts_barge.is_set():
+                    interrupted = True
+                    _safe_sd_stop(where="playback_fallback_interrupt", blocking=False)
+                    break
+                time.sleep(0.03)
+            else:
+                try:
+                    with playback_lock:
+                        sd.wait()
+                except Exception:
+                    pass
+    finally:
+        if owns_session:
+            _tts_barge.end_playback()
 
     log_debug(
         "Audio",
@@ -6004,9 +6054,12 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
       * a sharp RMS volume spike clears the stream-barge floor, OR
       * sustained VAD speech onset (classic barge-in).
 
-    Stands down when ``record_utterance`` already owns the mic queue.
+    Stands down when ``record_utterance`` already owns the mic queue, or when
+    the active utterance is an uninterruptible UI acknowledgment.
     """
     if vad_capture_active.is_set():
+        return
+    if not _tts_barge.is_playback_interruptible():
         return
 
     settle_s = BARGE_IN_SETTLE_MS / 1000.0
@@ -6019,11 +6072,14 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
                 or stop_event.is_set()
                 or not tts_busy.is_set()
                 or vad_capture_active.is_set()
+                or not _tts_barge.is_playback_interruptible()
             ):
                 return
             time.sleep(0.02)
 
     if vad_capture_active.is_set():
+        return
+    if not _tts_barge.is_playback_interruptible():
         return
 
     # Drop frames accumulated while wake-word was idle during TTS settle.
@@ -6214,7 +6270,12 @@ def _play_ready_chime(output_device: Optional[int]) -> bool:
     return _play_pcm_interruptible(tone, sr, output_device)
 
 
-def _play_cached_wav(path: Path, output_device: Optional[int]) -> bool:
+def _play_cached_wav(
+    path: Path,
+    output_device: Optional[int],
+    *,
+    interruptible: bool = True,
+) -> bool:
     """Play a pre-rendered WAV via the interruptible PCM path (no Piper)."""
     audio_data, samplerate = sf.read(str(path), dtype="float32")
     if getattr(audio_data, "size", 0) == 0:
@@ -6223,12 +6284,14 @@ def _play_cached_wav(path: Path, output_device: Optional[int]) -> bool:
     frames = int(np.asarray(audio_data).reshape(-1).shape[0])
     log_debug(
         "TTS",
-        f"cache hit {path.name} frames={frames} sr={samplerate}",
+        f"cache hit {path.name} frames={frames} sr={samplerate} "
+        f"interruptible={interruptible}",
     )
     interrupted = _play_pcm_interruptible(
         np.asarray(audio_data, dtype=np.float32),
         int(samplerate),
         output_device,
+        interruptible=interruptible,
     )
     if interrupted:
         _safe_sd_stop(where="tts_cache_interrupted", blocking=False)
@@ -6242,7 +6305,12 @@ def _play_cached_wav(path: Path, output_device: Optional[int]) -> bool:
     return interrupted
 
 
-def _synthesize_and_play(text: str, output_device: Optional[int]) -> bool:
+def _synthesize_and_play(
+    text: str,
+    output_device: Optional[int],
+    *,
+    interruptible: bool = True,
+) -> bool:
     """Worker-only: Piper synth + interruptible playback under ``playback_lock``.
 
     Returns True if barge-in aborted playback. Producers must use ``enqueue_speech``.
@@ -6255,7 +6323,9 @@ def _synthesize_and_play(text: str, output_device: Optional[int]) -> bool:
     cache_path = canned_ux_cache_path(text)
     if cache_path is not None and cache_path.is_file() and cache_path.stat().st_size > 44:
         try:
-            return _play_cached_wav(cache_path, output_device)
+            return _play_cached_wav(
+                cache_path, output_device, interruptible=interruptible
+            )
         except Exception as exc:  # noqa: BLE001
             log_debug("TTS", f"cache play failed ({exc}); live Piper fallback")
 
@@ -6264,7 +6334,8 @@ def _synthesize_and_play(text: str, output_device: Optional[int]) -> bool:
     t_synth0 = time.perf_counter()
     log_debug(
         "TTS",
-        f"Piper route -> {lang} ({os.path.basename(model_path)}) chars={len(text)}",
+        f"Piper route -> {lang} ({os.path.basename(model_path)}) chars={len(text)} "
+        f"interruptible={interruptible}",
     )
 
     voice = get_piper_voice(model_path)
@@ -6299,6 +6370,7 @@ def _synthesize_and_play(text: str, output_device: Optional[int]) -> bool:
                 np.asarray(audio_data, dtype=np.float32),
                 int(samplerate),
                 output_device,
+                interruptible=interruptible,
             )
             if interrupted:
                 _safe_sd_stop(where="tts_play_interrupted", blocking=False)
@@ -6342,6 +6414,7 @@ def _speak_with_timeout(
     output_device: Optional[int],
     *,
     max_seconds: float = TTS_UTTERANCE_MAX_SECONDS,
+    interruptible: bool = True,
 ) -> bool:
     """Play on a watchdog-guarded helper thread; abort if it exceeds ``max_seconds``."""
     result: list[bool] = [False]
@@ -6350,7 +6423,11 @@ def _speak_with_timeout(
     def _run() -> None:
         _boost_audio_thread_priority()
         try:
-            result[0] = bool(_synthesize_and_play(text, output_device))
+            result[0] = bool(
+                _synthesize_and_play(
+                    text, output_device, interruptible=interruptible
+                )
+            )
         except BaseException as exc:  # noqa: BLE001
             error[0] = exc
 
@@ -6363,7 +6440,8 @@ def _speak_with_timeout(
             f"WARNING: utterance exceeded {max_seconds:.0f}s — "
             "aborting playback and releasing audio device",
         )
-        interrupt_tts(reason="utterance_timeout")
+        # Hard timeout always wins — even UX acks must not hang forever.
+        interrupt_tts(reason="utterance_timeout", force=True)
         worker.join(timeout=2.0)
         if worker.is_alive():
             log(
@@ -6456,13 +6534,15 @@ def tts_worker() -> None:
     while not stop_event.is_set():
         try:
             try:
-                text = tts_queue.get(timeout=0.2)
+                raw_item = tts_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            if text is None:
+            if raw_item is None:
                 speech_idle.set()
                 break
+
+            text, item_interruptible = _parse_tts_spool_item(raw_item)
 
             # Drop orphaned spool items after a barge-in latch.
             if _tts_barge.is_set():
@@ -6473,7 +6553,7 @@ def tts_worker() -> None:
                 continue
 
             # Hold while the user is speaking — do not overlap mic capture.
-            if not _wait_tts_clear_of_user_speech(str(text)):
+            if not _wait_tts_clear_of_user_speech(text):
                 if tts_queue.empty() and not tts_busy.is_set():
                     speech_idle.set()
                 continue
@@ -6481,16 +6561,21 @@ def tts_worker() -> None:
             _tts_barge.clear()
             tts_busy.set()
             speech_idle.clear()
+            # Latch exemption BEFORE any mic/VAD path can see tts_busy (self-barge race).
+            _tts_barge.begin_playback(interruptible=item_interruptible)
             prev_ui = get_ui_state()
             set_ui_state("speaking")
             watcher_stop = threading.Event()
-            watcher = threading.Thread(
-                target=barge_in_watch,
-                args=(watcher_stop,),
-                name="BargeInWatch",
-                daemon=True,
-            )
-            watcher.start()
+            watcher: threading.Thread | None = None
+            # UI acknowledgments: no stream-barge watcher (prevents self-barge-in).
+            if item_interruptible:
+                watcher = threading.Thread(
+                    target=barge_in_watch,
+                    args=(watcher_stop,),
+                    name="BargeInWatch",
+                    daemon=True,
+                )
+                watcher.start()
             interrupted = False
             turn_t0 = time.perf_counter()
             time.sleep(0.05)
@@ -6498,9 +6583,16 @@ def tts_worker() -> None:
                 log_debug(
                     "TTS",
                     f'play start t={turn_t0:.3f} chars={len(text)} '
-                    f'pending={tts_queue.qsize()} preview="{str(text)[:80]}"',
+                    f'interruptible={item_interruptible} '
+                    f'pending={tts_queue.qsize()} preview="{text[:80]}"',
                 )
-                interrupted = bool(_speak_with_timeout(str(text), AUDIO_OUTPUT_DEVICE))
+                interrupted = bool(
+                    _speak_with_timeout(
+                        text,
+                        AUDIO_OUTPUT_DEVICE,
+                        interruptible=item_interruptible,
+                    )
+                )
             except Exception as exc:  # noqa: BLE001
                 if _is_portaudio_error(exc):
                     if not audio_hardware_fault.is_set():
@@ -6510,13 +6602,18 @@ def tts_worker() -> None:
                 interrupted = True
             finally:
                 watcher_stop.set()
-                try:
-                    watcher.join(timeout=1.0)
-                except Exception:
-                    pass
+                if watcher is not None:
+                    try:
+                        watcher.join(timeout=1.0)
+                    except Exception:
+                        pass
                 _safe_sd_stop(where="tts_worker_turn_end", blocking=False)
-                barged = interrupted or tts_interrupt_event.is_set()
+                barged = bool(
+                    item_interruptible
+                    and (interrupted or tts_interrupt_event.is_set())
+                )
                 tts_busy.clear()
+                _tts_barge.end_playback()
                 if barged:
                     # Instantly dump any pending system messages after cut-off.
                     dropped = flush_tts_queue()

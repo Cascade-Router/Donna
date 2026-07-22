@@ -20,12 +20,18 @@ class TtsWorker:
     Playback code registers the active ``OutputStream`` so ``interrupt()`` can
     ``abort()`` it without waiting on the writer’s ``playback_lock`` (avoids the
     race where ``sd.stop`` was deferred while a chunk write held the lock).
+
+    Short UI acknowledgments play with ``interruptible=False`` so speaker bleed
+    cannot self-barge; LLM synthesis keeps ``interruptible=True`` (zero-latency).
     """
 
     def __init__(self, *, barge_in_event: threading.Event | None = None) -> None:
         self._barge_in_event = barge_in_event or threading.Event()
         self._stream_lock = threading.Lock()
         self._active_stream: Any | None = None
+        self._playback_lock = threading.Lock()
+        self._playback_interruptible = True
+        self._playback_active = False
         self._flush_fn: _FlushFn | None = None
         self._sd_stop_fn: _StopFn | None = None
         self._set_ui_fn: _UiFn | None = None
@@ -57,6 +63,33 @@ class TtsWorker:
         if busy_fn is not None:
             self._busy_fn = busy_fn
 
+    def begin_playback(self, *, interruptible: bool = True) -> None:
+        """Mark the start of a play_audio turn (state-machine exemption latch)."""
+        with self._playback_lock:
+            self._playback_active = True
+            self._playback_interruptible = bool(interruptible)
+
+    def end_playback(self) -> None:
+        """Clear the playback latch after audio finishes (interruptible or not)."""
+        with self._playback_lock:
+            self._playback_active = False
+            self._playback_interruptible = True
+
+    def is_playback_active(self) -> bool:
+        with self._playback_lock:
+            return bool(self._playback_active)
+
+    def is_playback_interruptible(self) -> bool:
+        with self._playback_lock:
+            # Idle / between utterances → allow barge-in arming for the next turn.
+            if not self._playback_active:
+                return True
+            return bool(self._playback_interruptible)
+
+    def play_audio(self, *, interruptible: bool = True) -> Any:
+        """Context manager: ``with worker.play_audio(interruptible=False): ...``."""
+        return _PlaybackSession(self, interruptible=interruptible)
+
     def register_output_stream(self, stream: Any) -> None:
         with self._stream_lock:
             self._active_stream = stream
@@ -72,8 +105,26 @@ class TtsWorker:
     def clear(self) -> None:
         self._barge_in_event.clear()
 
-    def interrupt(self, *, reason: str = "", set_listening: bool = True) -> int:
-        """Hard barge-in: flag → flush spool → abort stream → stop device."""
+    def interrupt(
+        self,
+        *,
+        reason: str = "",
+        set_listening: bool = True,
+        force: bool = False,
+    ) -> int:
+        """Hard barge-in: flag → flush spool → abort stream → stop device.
+
+        No-ops instantly when the active utterance is a UI acknowledgment
+        (``interruptible=False``), unless ``force=True`` (utterance watchdog).
+        """
+        if not force and not self.is_playback_interruptible():
+            if reason:
+                _log.debug(
+                    "TTS barge-in ignored (uninterruptible UX ack) reason=%s",
+                    reason,
+                )
+            return 0
+
         self._barge_in_event.set()
 
         dropped = 0
@@ -139,6 +190,19 @@ class TtsWorker:
             return bool(self._busy_fn())
         except Exception:  # noqa: BLE001
             return False
+
+
+class _PlaybackSession:
+    def __init__(self, worker: TtsWorker, *, interruptible: bool) -> None:
+        self._worker = worker
+        self._interruptible = interruptible
+
+    def __enter__(self) -> TtsWorker:
+        self._worker.begin_playback(interruptible=self._interruptible)
+        return self._worker
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self._worker.end_playback()
 
 
 _CONTROLLER: TtsWorker | None = None

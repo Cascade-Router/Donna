@@ -61,17 +61,17 @@ jobs:
             mkdir -p dist/Donna.app/Contents/MacOS
             cp -R dist/Donna/. dist/Donna.app/Contents/MacOS/
             cat > dist/Donna.app/Contents/Info.plist <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleExecutable</key><string>Donna</string>
-  <key>CFBundleIdentifier</key><string>com.donna.agent</string>
-  <key>CFBundleName</key><string>Donna</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-</dict>
-</plist>
-PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>Donna</string>
+            <key>CFBundleIdentifier</key><string>com.donna.agent</string>
+            <key>CFBundleName</key><string>Donna</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+          </dict>
+          </plist>
+          PLIST
             APP_SRC=dist/Donna.app
           else
             ls -laR dist || true

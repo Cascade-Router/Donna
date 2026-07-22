@@ -2,12 +2,93 @@
 
 from __future__ import annotations
 
+import os
+import platform
+import subprocess
+import threading
 import time
 from typing import Any
 
 import customtkinter as ctk
 
 from donna.ui.trace_bus import TraceEvent, get_trace_bus
+
+
+def _startup_log_path() -> str:
+    """Locate OS-level donna_startup.log written by login/startup launchers."""
+    system = platform.system()
+    if system == "Windows":
+        return os.path.join(os.environ.get("TEMP", os.environ.get("TMP", ".")), "donna_startup.log")
+    return "/tmp/donna_startup.log"
+
+
+def _project_root() -> str:
+    try:
+        from donna.paths import PROJECT_ROOT
+
+        return os.path.abspath(str(PROJECT_ROOT))
+    except Exception:  # noqa: BLE001
+        return os.path.abspath(os.getcwd())
+
+
+def _open_startup_log() -> str:
+    """Open the startup log in the native text editor (worker-thread safe)."""
+    log_path = _startup_log_path()
+    if not os.path.isfile(log_path):
+        try:
+            with open(log_path, "a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            return f"Startup log unavailable ({log_path}): {exc}"
+    system = platform.system()
+    try:
+        if system == "Windows":
+            os.startfile(log_path)  # type: ignore[attr-defined]
+        elif system == "Darwin":
+            subprocess.call(["open", log_path])
+        else:
+            subprocess.call(["xdg-open", log_path])
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to open startup log: {exc}"
+    return f"Opened startup log: {log_path}"
+
+
+def _spawn_headless_boot_terminal() -> str:
+    """Spawn a native terminal running ``python run.py --no-gui`` (keeps window open)."""
+    root = _project_root()
+    system = platform.system()
+    try:
+        if system == "Windows":
+            # ``start cmd /k`` keeps the console open after crash/traceback.
+            subprocess.Popen(
+                f'start cmd /k "cd /d {root} && python run.py --no-gui"',
+                shell=True,
+            )
+        elif system == "Darwin":
+            script = (
+                f'cd {root} && python run.py --no-gui; '
+                r'read -p "Press Enter to close"'
+            )
+            # Escape for AppleScript string literal.
+            escaped = script.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(
+                [
+                    "osascript",
+                    "-e",
+                    f'tell application "Terminal" to do script "{escaped}"',
+                ]
+            )
+        else:
+            subprocess.Popen(
+                [
+                    "x-terminal-emulator",
+                    "-e",
+                    f'bash -c "cd {root} && python run.py --no-gui; exec bash"',
+                ]
+            )
+    except Exception as exc:  # noqa: BLE001
+        return f"Failed to spawn headless terminal: {exc}"
+    return "Spawned headless boot terminal (python run.py --no-gui)."
 
 _MODE_COLORS = {
     "chat": "#10B981",
@@ -107,6 +188,54 @@ class LiveTracePanel(ctk.CTkFrame):
         self.payload.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.payload.insert("1.0", "Waiting for LangGraph transitions…\n")
         self.payload.configure(state="disabled")
+
+        dev = ctk.CTkFrame(self, fg_color=("gray90", "#121a2b"), corner_radius=0)
+        dev.pack(fill="x", padx=0, pady=0)
+        ctk.CTkLabel(
+            dev,
+            text="Developer Tools",
+            anchor="w",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(side="left", padx=12, pady=8)
+        ctk.CTkButton(
+            dev,
+            text="View Startup Log",
+            width=150,
+            command=self._on_view_startup_log,
+        ).pack(side="left", padx=6, pady=8)
+        ctk.CTkButton(
+            dev,
+            text="Test Headless Boot",
+            width=160,
+            command=self._on_test_headless_boot,
+        ).pack(side="left", padx=6, pady=8)
+
+    def _run_dev_action(self, action: Any, label: str) -> None:
+        """Run a developer action off the Tk main thread."""
+
+        def _worker() -> None:
+            try:
+                result = action()
+            except Exception as exc:  # noqa: BLE001
+                result = f"{label} failed: {exc}"
+            msg = str(result or label)
+
+            def _ui() -> None:
+                self._append_timeline(msg, accent=_MODE_COLORS.get("developer"))
+                self._set_payload(msg)
+
+            try:
+                self.after(0, _ui)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_worker, name=f"donna-dev-{label}", daemon=True).start()
+
+    def _on_view_startup_log(self) -> None:
+        self._run_dev_action(_open_startup_log, "View Startup Log")
+
+    def _on_test_headless_boot(self) -> None:
+        self._run_dev_action(_spawn_headless_boot_terminal, "Test Headless Boot")
 
     def _set_pill(self, phase: str, *, tool: str = "") -> None:
         self._phase = phase

@@ -84,6 +84,22 @@ async def run_react_langgraph(
         prompt = f"{prompt}\n\n{ag._DRAFT_CURSOR_TPM_RULE}"
     if ag._DRAFT_CURSOR_TERMINATION_RULE not in prompt:
         prompt = f"{prompt}\n\n{ag._DRAFT_CURSOR_TERMINATION_RULE}"
+    # Pre-compute explicit+mode merges early so hard-constraint text can list them.
+    from donna.tools.broker import merge_bound_tool_ids
+
+    _early_known = list(broker.registry.keys())
+    try:
+        _early_known = list(get_tool_registry().as_spec_dict().keys()) or _early_known
+    except Exception:  # noqa: BLE001
+        pass
+    _merged_always = merge_bound_tool_ids(
+        user_text=user_text,
+        forced_tool_id=forced_tool.tool_id if forced_tool is not None else None,
+        mode=ag.get_donna_mode(),
+        known_ids=_early_known,
+    )
+    _merged_always = list(dict.fromkeys(_merged_always))
+
     if forced_tool is not None:
         tid = forced_tool.tool_id
         if tid in _UNBOUND_TOOL_IDS:
@@ -96,15 +112,29 @@ async def run_react_langgraph(
                 "or any other tool for this turn unless the user clearly asked for it."
             )
         else:
-            prompt = (
-                f"{prompt}\n\n"
-                "ROUTER INTENT (HARD CONSTRAINT):\n"
-                f"- You MUST prioritize tool `{tid}` for this turn "
-                f"(args hint: {dict(forced_tool.arguments)}).\n"
-                "- Do not substitute an unrelated tool. After the tool result, "
-                "speak a short natural answer — never read raw OK:/ERROR: strings aloud."
-            )
-            if tid == "draft_cursor_prompt":
+            extras = [t for t in _merged_always if t != tid and t not in _UNBOUND_TOOL_IDS]
+            if extras:
+                prompt = (
+                    f"{prompt}\n\n"
+                    "ROUTER INTENT (HARD CONSTRAINT):\n"
+                    f"- Prioritize tool `{tid}` first "
+                    f"(args hint: {dict(forced_tool.arguments)}).\n"
+                    f"- Also bind/call these explicitly requested tools this turn: "
+                    f"{', '.join(extras)}.\n"
+                    "- Do not drop explicit tool requests because of active mode. "
+                    "After tool results, speak a short natural answer — never read "
+                    "raw OK:/ERROR: strings aloud."
+                )
+            else:
+                prompt = (
+                    f"{prompt}\n\n"
+                    "ROUTER INTENT (HARD CONSTRAINT):\n"
+                    f"- You MUST prioritize tool `{tid}` for this turn "
+                    f"(args hint: {dict(forced_tool.arguments)}).\n"
+                    "- Do not substitute an unrelated tool. After the tool result, "
+                    "speak a short natural answer — never read raw OK:/ERROR: strings aloud."
+                )
+            if tid == "draft_cursor_prompt" or "draft_cursor_prompt" in extras:
                 prompt += f"\n- {ag._DRAFT_CURSOR_TPM_RULE}"
                 prompt += f"\n- {ag._DRAFT_CURSOR_TERMINATION_RULE}"
             if tid == "architect_new_tool":
@@ -126,7 +156,18 @@ async def run_react_langgraph(
     lc_messages = ag._dicts_to_lc_messages(seed)
 
     semantic = get_tool_registry()
-    always = [forced_tool.tool_id] if forced_tool is not None else []
+    known_ids = list(semantic.as_spec_dict().keys()) or list(broker.registry.keys())
+    # Prefer the early merge (same inputs); recompute if registry grew.
+    always = list(
+        dict.fromkeys(
+            merge_bound_tool_ids(
+                user_text=user_text,
+                forced_tool_id=forced_tool.tool_id if forced_tool is not None else None,
+                mode=ag.get_donna_mode(),
+                known_ids=known_ids,
+            )
+        )
+    )
     top_specs = semantic.retrieve_specs(user_text, k=6, always_include=always)
     bind_registry = top_specs if top_specs else broker.registry
     tools = build_langchain_tools(
@@ -135,6 +176,16 @@ async def run_react_langgraph(
         tool_ids=set(bind_registry.keys()) if top_specs else None,
     )
     bound_names = {getattr(t, "name", "") for t in tools}
+    try:
+        from donna.logging import log as _agentic_log
+
+        _agentic_log(
+            "Agentic",
+            f"tools={sorted(n for n in bound_names if n)} "
+            f"(always_include={always or '-'})",
+        )
+    except Exception:  # noqa: BLE001
+        pass
     llm = resolve_chat_model(
         query=user_text,
         forced_tool=forced_tool.tool_id if forced_tool is not None else None,
@@ -270,7 +321,18 @@ async def run_react_langgraph(
     def _rebind_tools_after_forge() -> None:
         nonlocal tools, bound_names, llm_with_tools, bind_registry
         semantic_fresh = get_tool_registry()
-        always_ids = [forced_tool.tool_id] if forced_tool is not None else []
+        always_ids = list(
+            dict.fromkeys(
+                merge_bound_tool_ids(
+                    user_text=user_text,
+                    forced_tool_id=(
+                        forced_tool.tool_id if forced_tool is not None else None
+                    ),
+                    mode=ag.get_donna_mode(),
+                    known_ids=list(semantic_fresh.as_spec_dict().keys()),
+                )
+            )
+        )
         top = semantic_fresh.retrieve_specs(user_text, k=8, always_include=always_ids)
         bind_registry = semantic_fresh.as_spec_dict() or top or broker.registry
         tools = build_langchain_tools(

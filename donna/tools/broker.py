@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -375,6 +375,66 @@ def _foresight_cascade(raw: str, tool_id: str | None) -> None:
         )
     except Exception:
         pass
+
+
+def explicit_tool_ids_in_text(
+    raw: str,
+    known_ids: Iterable[str] | None = None,
+) -> list[str]:
+    """Pre-flight keyword sweep: tool ids mentioned verbatim in the user prompt."""
+    blob = (raw or "").lower()
+    if not blob.strip():
+        return []
+    if known_ids is None:
+        try:
+            known_ids = list(load_tool_registry().keys())
+        except Exception:  # noqa: BLE001
+            known_ids = []
+    found: list[str] = []
+    # Longer ids first so nested/partial names do not shadow full tool ids.
+    for tid in sorted((str(x) for x in known_ids), key=len, reverse=True):
+        name = tid.strip().lower()
+        if len(name) < 3:
+            continue
+        if name in blob:
+            found.append(tid)
+    return list(dict.fromkeys(found))
+
+
+def merge_bound_tool_ids(
+    *,
+    user_text: str,
+    forced_tool_id: str | None = None,
+    mode: str | None = None,
+    known_ids: Iterable[str] | None = None,
+) -> list[str]:
+    """Merge mode/forced foresight with explicitly named tools (deduped).
+
+    Vision mode keeps ``analyze_visual_context`` bound (JIT vision path) while
+    any tool id spelled in the raw prompt is appended so mode overrides cannot
+    starve an explicit request (e.g. ``draft_cursor_prompt``).
+    """
+    if known_ids is None:
+        try:
+            known_ids = list(load_tool_registry().keys())
+        except Exception:  # noqa: BLE001
+            known_ids = []
+    known = {str(x) for x in known_ids}
+    merged: list[str] = []
+
+    def _add(tid: str | None) -> None:
+        name = (tid or "").strip()
+        if not name or name not in known:
+            return
+        if name not in merged:
+            merged.append(name)
+
+    _add(forced_tool_id)
+    if (mode or "").strip().lower() == "vision":
+        _add("analyze_visual_context")
+    for tid in explicit_tool_ids_in_text(user_text, known):
+        _add(tid)
+    return merged
 
 
 def initialize_tool_registry() -> list:

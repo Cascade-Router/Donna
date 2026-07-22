@@ -10,13 +10,58 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
 
+from donna.schema import AgenticResult
 from donna.tools.broker import IntentBroker, ToolValidationError, get_broker
 from donna.tools.schema import ToolCall
 
 REACT_MAX_ITERS = 3
+
+# Spoken when the local Ollama HTTP endpoint is down / refuses connections.
+OLLAMA_UNREACHABLE_SPEECH = (
+    "I cannot reach the local Ollama service. Please start the Ollama server."
+)
+
+
+def is_ollama_connection_error(exc: BaseException) -> bool:
+    """True for refused / unreachable Ollama (requests, httpx, or OS-level)."""
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    name = type(exc).__name__
+    module = getattr(type(exc), "__module__", "") or ""
+    if name in {
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "TimeoutException",
+        "NetworkError",
+        "ConnectionError",
+    }:
+        return True
+    if "httpx" in module or "httpcore" in module or "urllib3" in module:
+        if "connect" in name.lower() or "timeout" in name.lower():
+            return True
+    text = str(exc).lower()
+    needles = (
+        "connection refused",
+        "actively refused",
+        "failed to establish",
+        "name or service not known",
+        "nodename nor servname",
+        "cannot reach ollama",
+        "all connection attempts failed",
+        "10061",
+        "connection reset",
+    )
+    if any(n in text for n in needles):
+        return True
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and cause is not exc:
+        return is_ollama_connection_error(cause)
+    return False
+
 
 # Process-wide mode: chat (default) | developer | vision | research.
 donna_mode: str = "chat"
@@ -723,6 +768,17 @@ def flush_stream_sentence_tts() -> bool:
     return False
 
 
+def end_stream_sentence_tts() -> bool:
+    """Terminate streaming TTS: flush remainder and clear the sentence buffer.
+
+    Call when ReAct finishes an iteration without a tool call so producers do not
+    wait on an open stream buffer / speech_idle latch.
+    """
+    spoken = flush_stream_sentence_tts()
+    reset_stream_sentence_tts()
+    return spoken
+
+
 def feed_stream_tts(piece: str) -> int:
     """Buffer streaming tokens; enqueue only complete sentences. Returns count."""
     sentences = _stream_sentence_tts.feed(piece or "")
@@ -763,16 +819,16 @@ def _first_sentence(text: str, *, limit: int = 120) -> str:
 
 
 _FINAL_RE = re.compile(
-    r"^\s*(?:FINAL|Final|final|پاسخ نهایی)\s*[:：]\s*(.*)\s*$",
+    r"^\s*(?:FINAL|Final|final| )\s*[:：]\s*(.*)\s*$",
     re.DOTALL,
 )
 _TOOL_LINE_RE = re.compile(
-    r"^\s*(?:TOOL|Tool|tool|Action|ACTION|تابع|ابزار)\s*[:：]\s*(.+?)\s*$",
+    r"^\s*(?:TOOL|Tool|tool|Action|ACTION||)\s*[:：]\s*(.+?)\s*$",
     re.DOTALL,
 )
 # TTS hygiene: models occasionally leak protocol markers into spoken text.
 _TTS_TOOL_LEAK_RE = re.compile(
-    r"(?:^|\s)(?:TOOL|Action|FINAL|تابع|ابزار|پاسخ نهایی)\s*[:：]\s*.*$",
+    r"(?:^|\s)(?:TOOL|Action|FINAL||| )\s*[:：]\s*.*$",
     re.IGNORECASE | re.DOTALL,
 )
 _RAW_TOOL_OBS_RE = re.compile(
@@ -951,7 +1007,7 @@ def looks_like_raw_tool_observation(text: str) -> bool:
     if _RAW_TOOL_OBS_RE.match(t):
         return True
     if re.search(
-        r"\b(?:farsi_naming_fix|replacements=\d+|changed=(?:true|false))\b",
+        r"\b(?:naming_fix|replacements=\d+|changed=(?:true|false))\b",
         t,
         re.I,
     ):
@@ -1208,25 +1264,13 @@ def _normalize_tool_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-@dataclass
-class AgenticResult:
-    final_text: str
-    iterations: int
-    tool_trace: list[dict[str, Any]]
-    reply_lang: str
-    reflection: dict[str, Any] | None = None
-    reflection_ms: float = 0.0
-    had_errors: bool = False
-    tts_streamed: bool = False
-
-
 def extract_final(text: str) -> str | None:
     raw = (text or "").strip()
     if not raw:
         return None
     # Prefer an explicit FINAL segment even when the model also emitted a tool JSON.
     m_final = re.search(
-        r"(?:FINAL|پاسخ نهایی)\s*[:：]\s*(.+)$",
+        r"(?:FINAL| )\s*[:：]\s*(.+)$",
         raw,
         re.DOTALL | re.I,
     )
@@ -1237,7 +1281,7 @@ def extract_final(text: str) -> str | None:
         return m.group(1).strip()
     if _extract_json_object(raw) is not None:
         return None
-    if _TOOL_LINE_RE.match(raw) or re.match(r"^\s*(?:TOOL|Action|تابع|ابزار)\s*[:：]", raw, re.I):
+    if _TOOL_LINE_RE.match(raw) or re.match(r"^\s*(?:TOOL|Action||)\s*[:：]", raw, re.I):
         return None
     return raw
 
@@ -1282,7 +1326,7 @@ def _obs_fallback(observation: str, reply_lang: str) -> str:
     # Memory miss is recoverable — speak a natural line instead of the crash fallback.
     if _is_memory_key_miss(obs):
         return (
-            "نمی‌دونم منظورت چیه؛ اون کلید تو حافظه‌ام نیست."
+            "‌      ‌ ."
             if reply_lang == "fa"
             else "I don't know what you're referring to — that isn't in my memory."
         )
@@ -1313,10 +1357,10 @@ def _obs_fallback(observation: str, reply_lang: str) -> str:
                 ]
         if reply_lang == "fa":
             if len(loaded) > 1:
-                return f"{len(loaded)} ابزار ساخته شد: {', '.join(loaded[:5])}."
+                return f"{len(loaded)}   : {', '.join(loaded[:5])}."
             if loaded:
-                return f"ابزار `{loaded[0]}` ساخته و بارگذاری شد."
-            return "ابزار جدید ساخته و بارگذاری شد."
+                return f" `{loaded[0]}`    ."
+            return "     ."
         if len(loaded) > 1:
             return f"Done — I forged and hot-loaded {len(loaded)} tools: {', '.join(loaded[:5])}."
         if loaded:
@@ -1328,13 +1372,13 @@ def _obs_fallback(observation: str, reply_lang: str) -> str:
         comment = (cm.group(1).strip() if cm else "").strip()
         verdict = (vd.group(1).upper() if vd else "DONE")
         if reply_lang == "fa":
-            return f"اسلاید بررسی شد ({verdict}). نظر تایپ شد."
+            return f"   ({verdict}).   ."
         if comment:
             return f"Slide review {verdict}. I typed: {comment[:160]}"
         return f"Slide review complete ({verdict}); comment typed into the active window."
     if "evaluate_slide_and_type" in obs.lower() and obs.upper().startswith("ERROR:"):
         if reply_lang == "fa":
-            return "بررسی اسلاید انجام شد ولی تایپ شکست خورد."
+            return "       ."
         snip = obs.split("COMMENT_READY=", 1)[-1].split("\n", 1)[0].strip() if "COMMENT_READY=" in obs else ""
         if snip:
             return f"Slide review finished but typing failed. Comment was: {snip[:160]}"
@@ -1348,7 +1392,7 @@ def _obs_fallback(observation: str, reply_lang: str) -> str:
                 return extracted
     if reply_lang == "fa":
         if looks_raw or not obs:
-            return "نتونستم کامل جواب بدم؛ یک‌بار دیگه بپرس."
+            return "    ‌  ."
         return obs
     if looks_raw or not obs:
         return "I couldn't finish that cleanly — please ask me again."
@@ -1365,7 +1409,7 @@ def _is_memory_key_miss(observation: str) -> bool:
 
 
 _FALLBACK_EN = "I couldn't finish that cleanly — please ask me again."
-_FALLBACK_FA = "نتونستم کامل جواب بدم؛ یک‌بار دیگه بپرس."
+_FALLBACK_FA = "    ‌  ."
 
 
 def _maybe_record_bug_tracker(
@@ -1524,7 +1568,7 @@ def sanitize_spoken_reply(
     ):
         # Never TTS sandbox fixtures / vault-adjacent test docs as "answers".
         return (
-            "ببخشید، دوباره می‌پرسم."
+            "  ‌."
             if reply_lang == "fa"
             else "Sorry — that looked like an internal document dump. Please ask again."
         )
@@ -1533,7 +1577,7 @@ def sanitize_spoken_reply(
         if looks_like_confidential_fixture_leak(safe_obs or ""):
             safe_obs = ""
         return _obs_fallback(safe_obs, reply_lang) if safe_obs else (
-            "ببخشید، دوباره می‌پرسم."
+            "  ‌."
             if reply_lang == "fa"
             else "Sorry — please ask me again."
         )
@@ -1542,12 +1586,12 @@ def sanitize_spoken_reply(
             return (
                 "Sorry — that looked like an internal document dump. Please ask again."
                 if reply_lang != "fa"
-                else "ببخشید، دوباره می‌پرسم."
+                else "  ‌."
             )
         return _obs_fallback(last_obs or spoken, reply_lang)
     if _SYSTEM_META_HALLUCINATION_RE.search(spoken):
         return (
-            "ببخشید، دوباره می‌پرسم."
+            "  ‌."
             if reply_lang == "fa"
             else "Sorry — I couldn't complete that request cleanly. Please try again."
         )
@@ -1557,7 +1601,7 @@ def sanitize_spoken_reply(
             return (
                 "Sorry — that looked like an internal document dump. Please ask again."
                 if reply_lang != "fa"
-                else "ببخشید، دوباره می‌پرسم."
+                else "  ‌."
             )
         return _obs_fallback(last_obs, reply_lang)
     return spoken
@@ -1736,7 +1780,7 @@ _CLIPBOARD_ASK_RE = re.compile(
     r"\bclipboard\b|\bread\s+my\s+(?:clipboard|screen)\b|"
     r"\bcheck\s+what\s+i\s+copied\b|\bwhat\s+(?:did\s+i|i\s+just)\s+copied\b|"
     r"\bsummarize\s+what\s+i\s+(?:just\s+)?copied\b|\bwhat'?s\s+on\s+my\s+clipboard\b|"
-    r"چی\s*کپی|کلیپ[\s\-‌]*بورد"
+    r"\s*|[\s\-‌]*"
     r")",
     re.IGNORECASE,
 )
@@ -2001,7 +2045,7 @@ def build_lightweight_chat_system_prompt(
     parts = [_LIGHTWEIGHT_CHAT_SYSTEM]
     parts.append(_chat_situational_context())
     if reply_lang == "fa":
-        parts.append("Reply in Persian (Farsi) unless the user writes in English.")
+        parts.append("Reply in language (language) unless the user writes in English.")
     else:
         parts.append("Reply in English unless the user clearly writes in another language.")
     vision = (visual_context or "").strip()
@@ -2047,9 +2091,24 @@ def run_lightweight_chat(
         raise RuntimeError("run_lightweight_chat requires ask_fn (Ollama chat callable)")
 
     try:
-        raw = ask_fn(messages, model=model)
-    except TypeError:
-        raw = ask_fn(messages)
+        try:
+            raw = ask_fn(messages, model=model)
+        except TypeError:
+            raw = ask_fn(messages)
+    except Exception as exc:  # noqa: BLE001
+        if is_ollama_connection_error(exc):
+            spoken = OLLAMA_UNREACHABLE_SPEECH
+            return AgenticResult(
+                final_text=spoken,
+                iterations=0,
+                tool_trace=[{"error": f"ollama_unreachable:{exc}"}],
+                reply_lang=reply_lang,
+                reflection=None,
+                reflection_ms=0.0,
+                had_errors=True,
+                tts_streamed=False,
+            )
+        raise
 
     spoken = strip_r1_think_blocks(str(raw or ""))
     spoken = clip_spoken_answer(user_text, spoken, max_words=40)
@@ -2061,7 +2120,7 @@ def run_lightweight_chat(
     )
     if not (spoken or "").strip():
         spoken = (
-            "ببخشید، دوباره می‌پرسم."
+            "  ‌."
             if reply_lang == "fa"
             else "Sorry — please ask me again."
         )
@@ -2095,6 +2154,7 @@ def run_react_loop(
     visual_context: str | None = None,
     model: str = "llama3.2",
     forced_tool: ToolCall | None = None,
+    tts_callback: Callable[[str], None] | None = None,
 ) -> AgenticResult:
     """Native tool loop: ChatOllama.bind_tools → ToolMessage → spoken answer.
 
@@ -2116,6 +2176,7 @@ def run_react_loop(
                 visual_context=visual_context,
                 model=model,
                 forced_tool=forced_tool,
+                tts_callback=tts_callback,
             )
         )
     except RuntimeError:
@@ -2137,6 +2198,7 @@ def run_react_loop(
                     visual_context=visual_context,
                     model=model,
                     forced_tool=forced_tool,
+                    tts_callback=tts_callback,
                 )
             )
         finally:
@@ -2317,22 +2379,72 @@ async def _run_react_loop_langchain(
     visual_context: str | None,
     model: str,
     forced_tool: ToolCall | None = None,
+    tts_callback: Callable[[str], None] | None = None,
 ) -> AgenticResult:
     """Async LangGraph ReAct loop (MemorySaver + astream_events TTS)."""
     from donna.agentic_react_graph import run_react_langgraph
+    from donna.settings import resolve_reply_lang
 
-    return await run_react_langgraph(
-        user_text=user_text,
-        system_prompt=system_prompt,
-        execute_fn=execute_fn,
-        max_iters=max_iters,
-        broker=broker,
-        reflect_fn=reflect_fn,
-        vault_client=vault_client,
-        enable_reflection=enable_reflection,
-        prior_messages=prior_messages,
-        on_tool_start=on_tool_start,
-        visual_context=visual_context,
-        model=model,
-        forced_tool=forced_tool,
-    )
+    # Pre-flight: abort before the graph if Ollama is down (clear TTS, no silent fail).
+    if not ollama_service_reachable():
+        return AgenticResult(
+            final_text=OLLAMA_UNREACHABLE_SPEECH,
+            iterations=0,
+            tool_trace=[{"error": "ollama_unreachable:preflight"}],
+            reply_lang=resolve_reply_lang(user_text or ""),
+            reflection=None,
+            reflection_ms=0.0,
+            had_errors=True,
+            tts_streamed=False,
+        )
+
+    try:
+        return await run_react_langgraph(
+            user_text=user_text,
+            system_prompt=system_prompt,
+            execute_fn=execute_fn,
+            max_iters=max_iters,
+            broker=broker,
+            reflect_fn=reflect_fn,
+            vault_client=vault_client,
+            enable_reflection=enable_reflection,
+            prior_messages=prior_messages,
+            on_tool_start=on_tool_start,
+            visual_context=visual_context,
+            model=model,
+            forced_tool=forced_tool,
+            tts_callback=tts_callback,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if is_ollama_connection_error(exc):
+            return AgenticResult(
+                final_text=OLLAMA_UNREACHABLE_SPEECH,
+                iterations=0,
+                tool_trace=[{"error": f"ollama_unreachable:{exc}"}],
+                reply_lang=resolve_reply_lang(user_text or ""),
+                reflection=None,
+                reflection_ms=0.0,
+                had_errors=True,
+                tts_streamed=False,
+            )
+        raise
+
+
+def ollama_service_reachable(
+    *,
+    base_url: str = "http://127.0.0.1:11434",
+    timeout: float = 2.0,
+) -> bool:
+    """Cheap health check against the local Ollama ``/api/tags`` endpoint."""
+    import urllib.error
+    import urllib.request
+
+    url = base_url.rstrip("/") + "/api/tags"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= int(getattr(resp, "status", 200) or 200) < 300
+    except (urllib.error.URLError, TimeoutError, OSError, ConnectionError):
+        return False
+    except Exception:  # noqa: BLE001
+        return False

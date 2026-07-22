@@ -16,14 +16,18 @@ def test_write_start_bat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     (tmp_path / "run.py").write_text("# stub entry\n", encoding="utf-8")
     venv_scripts = tmp_path / ".venv" / "Scripts"
     venv_scripts.mkdir(parents=True)
-    (venv_scripts / "pythonw.exe").write_bytes(b"")
+    (venv_scripts / "python.exe").write_bytes(b"")
 
     bat = setup_startup.write_start_bat()
     assert bat == tmp_path / "start_donna.bat"
     text = bat.read_text(encoding="utf-8")
     assert "run.py" in text
     assert "core_agent.py" not in text
-    assert "pythonw.exe" in text
+    assert "python.exe" in text
+    assert "--no-gui" in text
+    assert r"%TEMP%\donna_startup.log" in text or "%TEMP%\\donna_startup.log" in text
+    assert "cd /d" in text
+    assert "2>&1" in text
     print(f"[PASS] start_donna.bat written: {bat}")
 
 
@@ -69,6 +73,11 @@ def test_enable_disable_macos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     text = plist.read_text(encoding="utf-8")
     assert setup_startup.MACOS_LABEL in text
     assert "run.py" in text
+    assert "--no-gui" in text
+    assert "WorkingDirectory" in text
+    assert "StandardOutPath" in text
+    assert "StandardErrorPath" in text
+    assert "/tmp/donna_startup.log" in text
     assert setup_startup.startup_status() == 0
     assert setup_startup.disable_startup() == 0
     assert not plist.exists()
@@ -89,6 +98,11 @@ def test_enable_disable_linux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     text = desktop.read_text(encoding="utf-8")
     assert "[Desktop Entry]" in text
     assert "run.py" in text
+    assert "--no-gui" in text
+    assert f"Path={tmp_path.resolve()}" in text or "Path=" in text
+    assert "/tmp/donna_startup.log" in text
+    assert "2>&1" in text
+    assert "/bin/bash -c" in text
     assert setup_startup.startup_status() == 0
     assert setup_startup.disable_startup() == 0
     assert not desktop.exists()

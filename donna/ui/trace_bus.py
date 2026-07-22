@@ -8,45 +8,16 @@ from __future__ import annotations
 
 import queue
 import threading
-import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any
 
-TraceEventType = Literal[
-    "node_enter",
-    "node_exit",
-    "tool_execution",
-    "state_update",
-    "mode",
-    "status",
-]
-
-
-@dataclass(frozen=True)
-class TraceEvent:
-    """Normalized bus payload for Live Trace rendering."""
-
-    event_type: TraceEventType
-    node: str = ""
-    message: str = ""
-    mode: str = ""
-    tool: str = ""
-    latency_ms: float | None = None
-    payload: str = ""
-    state_keys: tuple[str, ...] = ()
-    ts: float = field(default_factory=time.time)
-
-    def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["state_keys"] = list(self.state_keys)
-        return data
-
-
-# Back-compat aliases requested by the mission brief.
-NodeEnterEvent = TraceEvent
-NodeExitEvent = TraceEvent
-ToolExecutionEvent = TraceEvent
-StateUpdateEvent = TraceEvent
+from donna.schema import (
+    NodeEnterEvent,
+    NodeExitEvent,
+    StateUpdateEvent,
+    ToolExecutionEvent,
+    TraceEvent,
+    TraceEventType,
+)
 
 
 class TraceEventBus:

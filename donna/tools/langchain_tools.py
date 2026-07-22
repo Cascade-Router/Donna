@@ -76,7 +76,27 @@ def _register_watchdog_process(
             entry["process"] = process
 
 
-def _watchdog_worker(task_id: str, task: str) -> None:
+def _emit_tts(
+    tts_callback: Callable[[str], None] | None,
+    text: str,
+) -> None:
+    """Speak via injected callback only (no core_agent import)."""
+    if tts_callback is None:
+        return
+    phrase = (text or "").strip()
+    if not phrase:
+        return
+    try:
+        tts_callback(phrase)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _watchdog_worker(
+    task_id: str,
+    task: str,
+    tts_callback: Callable[[str], None] | None = None,
+) -> None:
     """Background: compile + invoke the Donna↔Titan Watchdog StateGraph."""
     with _watchdog_lock:
         entry = active_watchdogs.get(task_id)
@@ -119,14 +139,16 @@ def _watchdog_worker(task_id: str, task: str) -> None:
             or status.upper().startswith("REJECTED")
         ):
             try:
-                from donna.core_agent import enqueue_speech
                 from donna.logging import log
 
                 tip = feedback.strip()[:160] or status
                 log("Watchdog", f"Watchdog ended with failure: {tip}")
                 # Avoid double-speaking the terminal_failure phrase.
                 if "had to abort" not in tip.lower():
-                    enqueue_speech(f"Watchdog could not stay active: {tip}")
+                    _emit_tts(
+                        tts_callback,
+                        f"Watchdog could not stay active: {tip}",
+                    )
             except Exception:
                 pass
     except Exception as exc:  # noqa: BLE001
@@ -137,19 +159,20 @@ def _watchdog_worker(task_id: str, task: str) -> None:
                 log_exception("Watchdog", "Watchdog deployment failed", exc=exc)
             except Exception:
                 pass
-            try:
-                from donna.core_agent import enqueue_speech
-
-                enqueue_speech(f"Watchdog deployment failed: {exc}")
-            except Exception:
-                pass
+            _emit_tts(tts_callback, f"Watchdog deployment failed: {exc}")
     finally:
         with _watchdog_lock:
             active_watchdogs.pop(task_id, None)
 
 
-def dispatch_watchdog_impl(task: str) -> str:
+def dispatch_watchdog_impl(
+    task: str,
+    *,
+    tts_callback: Callable[[str], None] | None = None,
+    vault_client: Any | None = None,
+) -> str:
     """Fire-and-forget Watchdog graph on a daemon thread (ReAct-safe)."""
+    _ = vault_client  # reserved for callers that inject VaultClient via DI
     q = (task or "").strip()
     if not q:
         return "ERROR: missing task"
@@ -176,7 +199,7 @@ def dispatch_watchdog_impl(task: str) -> str:
     stop = threading.Event()
     thread = threading.Thread(
         target=_watchdog_worker,
-        args=(task_id, q),
+        args=(task_id, q, tts_callback),
         name=f"DonnaWatchdog-{task_id}",
         daemon=True,
     )
@@ -367,12 +390,36 @@ _NATIVE_TOOL_IDS = frozenset(
 _UNBOUND_TOOL_IDS = frozenset({"describe_spatial_scene", "read_clipboard_context"})
 
 
+def _make_dispatch_watchdog_tool(
+    tts_callback: Callable[[str], None] | None,
+    vault_client: Any | None,
+) -> StructuredTool:
+    """LangChain tool closed over injected TTS / vault (no core_agent import)."""
+
+    def _run(task: str) -> str:
+        return dispatch_watchdog_impl(
+            task,
+            tts_callback=tts_callback,
+            vault_client=vault_client,
+        )
+
+    _run.__name__ = "dispatch_watchdog"
+    _run.__doc__ = _WATCHDOG_TOOL_DESCRIPTION
+    return StructuredTool.from_function(
+        func=_run,
+        name="dispatch_watchdog",
+        description=_WATCHDOG_TOOL_DESCRIPTION,
+    )
+
+
 def build_langchain_tools(
     execute_fn: Callable[[ToolCall], str],
     *,
     registry: dict[str, ToolSpec] | None = None,
     tool_ids: set[str] | frozenset[str] | None = None,
     include_natives: bool = True,
+    tts_callback: Callable[[str], None] | None = None,
+    vault_client: Any | None = None,
 ) -> list[Any]:
     """Convert ``tools.json`` entries + native tools (e.g. Watchdog) for bind_tools.
 
@@ -390,7 +437,9 @@ def build_langchain_tools(
         tools.append(_make_structured_tool(spec, execute_fn))
     if include_natives:
         if tool_ids is None or "dispatch_watchdog" in tool_ids:
-            tools.append(dispatch_watchdog)
+            tools.append(
+                _make_dispatch_watchdog_tool(tts_callback, vault_client)
+            )
         if tool_ids is None or "kill_watchdog" in tool_ids:
             tools.append(kill_watchdog)
         if tool_ids is None or "save_script_to_library" in tool_ids:

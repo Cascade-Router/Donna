@@ -54,7 +54,7 @@ def test_wipe_custom_tools_deletes_py_keeps_init(custom_dir, monkeypatch):
 
     reg = get_tool_registry()
     reg.register(
-        ToolSpec(id="echo_demo", description_en="demo", description_fa="دمو"),
+        ToolSpec(id="echo_demo", description_en="demo", description_fa=""),
         source="forge",
         ephemeral=True,
         metadata={"path": str(tool)},

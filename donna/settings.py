@@ -11,14 +11,14 @@ from donna.paths import DONNA_WORKSPACE, PROJECT_ROOT, SETTINGS_PATH as _SETTING
 _ROOT = str(PROJECT_ROOT)
 SETTINGS_PATH = str(_SETTINGS_PATH)
 
-# Production defaults — Tool Forge unlocked; English-first until Persian is re-enabled.
+# Production defaults — Tool Forge unlocked; English-only public release.
 DEFAULT_FLAGS: dict[str, Any] = {
     "enable_dynamic_tool_synthesis": True,
     # Cascade Router: escalate high-complexity turns to an external LLM when available.
     "enable_cascade_router": False,
-    # en = English-only STT/reply/TTS | fa = Persian-first | auto = detect from transcript
+    # Public release: English-only STT / reply / TTS.
     "assistant_language": "en",
-    # HF Whisper.generate language id: "english" | "persian"
+    # HF Whisper.generate language id (English lock).
     "whisper_language": "english",
     # IANA timezone (e.g. America/Los_Angeles) for local clock + kickoff conversion.
     "timezone": "America/Los_Angeles",
@@ -29,42 +29,21 @@ DEFAULT_FLAGS: dict[str, Any] = {
 
 
 def get_assistant_language() -> str:
-    """Return en | fa | auto from settings (default en for production English-first)."""
-    raw = str(load_donna_settings().get("assistant_language") or "en").strip().lower()
-    if raw in ("en", "english"):
-        return "en"
-    if raw in ("fa", "farsi", "persian"):
-        return "fa"
-    if raw in ("auto", "detect", "mixed"):
-        return "auto"
+    """Return assistant language lock (public release: always ``en``)."""
+    _ = load_donna_settings().get("assistant_language")
     return "en"
 
 
 def get_whisper_language() -> str:
-    """HF transformers Whisper language id."""
-    cfg = load_donna_settings()
-    raw = str(cfg.get("whisper_language") or "").strip().lower()
-    if raw in ("english", "en"):
-        return "english"
-    if raw in ("persian", "farsi", "fa"):
-        return "persian"
-    # Derive from assistant_language when whisper_language omitted.
-    mode = get_assistant_language()
-    if mode == "fa":
-        return "persian"
+    """HF transformers Whisper language id (public release: always English)."""
+    _ = load_donna_settings()
     return "english"
 
 
 def resolve_reply_lang(user_text: str = "") -> str:
-    """Language lock for ReAct FINAL / TTS routing."""
-    mode = get_assistant_language()
-    if mode == "en":
-        return "en"
-    if mode == "fa":
-        return "fa"
-    from donna.tools.normalize import detect_lang
-
-    return detect_lang(user_text) if user_text else "en"
+    """Language lock for ReAct FINAL / TTS routing (public release: always ``en``)."""
+    _ = user_text
+    return "en"
 
 
 def get_timezone() -> str:
@@ -231,13 +210,8 @@ def is_dynamic_tool_synthesis_enabled() -> bool:
 
 
 def synthesis_locked_message(lang: str = "en") -> str:
-    """Bilingual graceful-degradation copy when synthesis is production-locked."""
-    if lang in ("fa", "mixed"):
-        return (
-            "قابلیت ساخت پویای ابزار الان برای ایمنی محیط تولید قفل است "
-            "و نمی‌توانم کد جدید تولید یا تست کنم. "
-            "برای فعال‌سازی موقت، enable_dynamic_tool_synthesis را در settings.json روی true بگذارید."
-        )
+    """Graceful-degradation copy when synthesis is locked (English-only)."""
+    _ = lang
     return (
         "My dynamic tool synthesis capabilities are currently locked for production safety, "
         "and I cannot generate or test new code at this time. "

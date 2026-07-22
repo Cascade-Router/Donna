@@ -801,7 +801,7 @@ def hot_load_forged_tool(state: ToolForgeState) -> dict[str, Any]:
     tool_spec = ToolSpec(
         id=tool_name,
         description_en=description or f"Forged tool {tool_name}",
-        description_fa=f"ابزار ساخته‌شده `{tool_name}`",
+        description_fa=f" ‌ `{tool_name}`",
         parameters=(
             ToolParameterSpec(
                 name="text",

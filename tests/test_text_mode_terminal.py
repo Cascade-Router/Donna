@@ -125,7 +125,7 @@ def main() -> int:
     dumped = _looks_like_raw_dump(final, obs_blob)
     fallback = bool(
         re.search(
-            r"couldn't finish|please ask me again|نتونستم|لطفاً دوباره",
+            r"couldn't finish|please ask me again|| ",
             final,
             re.I,
         )

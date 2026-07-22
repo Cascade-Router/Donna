@@ -4646,7 +4646,11 @@ def execute_tool_call(tc: ToolCall) -> str:
             task = call.arguments.get("query")
         if task is None or not str(task).strip():
             return "ERROR: missing task"
-        return dispatch_watchdog_impl(str(task).strip())
+        return dispatch_watchdog_impl(
+            str(task).strip(),
+            tts_callback=enqueue_speech,
+            vault_client=vault_client if vault_client.session_token else None,
+        )
 
     def _handle_kill_watchdog(call: ToolCall) -> str:
         from donna.tools.langchain_tools import kill_watchdog_impl
@@ -5237,6 +5241,32 @@ def conversation_worker(
                 return True
 
             if use_chat:
+                # Telemetry parity with agentic_react_graph agent/router nodes.
+                _chat_trace_t0 = time.perf_counter()
+                try:
+                    from donna.schema import TraceEvent
+                    from donna.ui.trace_bus import TraceEventBus
+
+                    _bus = TraceEventBus.instance()
+                    _bus.emit(
+                        TraceEvent(
+                            event_type="node_enter",
+                            node="router",
+                            message="Chat turn start",
+                            mode="chat",
+                            state_keys=("messages",),
+                        )
+                    )
+                    _bus.emit(
+                        TraceEvent(
+                            event_type="status",
+                            node="synthesis",
+                            message="LLM synthesis streaming",
+                            mode="chat",
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 result = run_lightweight_chat(
                     user_text=whisper_text,
                     system_prompt=system_prompt,
@@ -5246,6 +5276,24 @@ def conversation_worker(
                     use_chat_memory=True,
                 )
                 answer = result.final_text
+                try:
+                    from donna.schema import TraceEvent
+                    from donna.ui.trace_bus import TraceEventBus
+
+                    TraceEventBus.instance().emit(
+                        TraceEvent(
+                            event_type="node_exit",
+                            node="synthesis",
+                            message="Chat complete",
+                            mode="chat",
+                            payload=(answer or "")[:800],
+                            latency_ms=(time.perf_counter() - _chat_trace_t0)
+                            * 1000.0,
+                            state_keys=("final_raw", "messages"),
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 log(
                     "Conversation",
                     f"Lightweight chat node (tools/MoA bypassed; "
@@ -5267,6 +5315,7 @@ def conversation_worker(
                     # LangChain ChatOllama + bind_tools (native tool calling).
                     model=OLLAMA_MODEL,
                     forced_tool=routed_tool,
+                    tts_callback=enqueue_speech,
                 )
                 answer = result.final_text
                 # Belt-and-suspenders TTS gate (also runs inside run_react_loop).

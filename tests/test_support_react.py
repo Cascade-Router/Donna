@@ -20,7 +20,7 @@ ScriptFn = Callable[[list[dict[str, str]]], str]
 ScriptSource = Sequence[str] | ScriptFn | list[str]
 
 _TOOL_HEAD_RE = re.compile(
-    r"^\s*(?:TOOL|Tool|tool|Action|ACTION|تابع|ابزار)\s*[:：]\s*(.+?)\s*$",
+    r"^\s*(?:TOOL|Tool|tool|Action|ACTION||)\s*[:：]\s*(.+?)\s*$",
     re.DOTALL,
 )
 
@@ -65,7 +65,7 @@ def script_line_to_aimessage(
         return AIMessage(content="")
 
     # Explicit FINAL → conversational content (prefix stripped later by loop).
-    if re.match(r"^\s*(?:FINAL|Final|final|پاسخ نهایی)\s*[:：]", text):
+    if re.match(r"^\s*(?:FINAL|Final|final| )\s*[:：]", text):
         return AIMessage(content=text)
 
     # JSON tool object (legacy test scripts only).
@@ -139,7 +139,7 @@ def patch_scripted_llm(
             return script_line_to_aimessage(str(raw or ""), broker=broker, call_id=call_id)
 
     class _FakeLLM:
-        def bind_tools(self, _tools):  # noqa: ANN001
+        def bind_tools(self, _tools, **_kwargs):  # noqa: ANN001
             return _Bound()
 
     monkeypatch.setattr("langchain_ollama.ChatOllama", lambda **_kwargs: _FakeLLM())

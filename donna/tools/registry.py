@@ -547,7 +547,7 @@ def load_general_tools_from_disk() -> list[str]:
                     "_intent": (name.replace("_", " "),)
                 }
                 aliases_fa = existing.spec.aliases_fa or {"_intent": (name,)}
-                description_fa = existing.spec.description_fa or f"ابزار عمومی `{name}`"
+                description_fa = existing.spec.description_fa or f"  `{name}`"
                 description_en = existing.spec.description_en or description
             else:
                 parameters = (
@@ -560,7 +560,7 @@ def load_general_tools_from_disk() -> list[str]:
                 )
                 aliases_en = {"_intent": (name.replace("_", " "),)}
                 aliases_fa = {"_intent": (name,)}
-                description_fa = f"ابزار عمومی `{name}`"
+                description_fa = f"  `{name}`"
                 description_en = description
             tool_spec = ToolSpec(
                 id=name,
@@ -646,7 +646,7 @@ def load_custom_tools_from_disk() -> list[str]:
                 tool_spec = ToolSpec(
                     id=name,
                     description_en=description,
-                    description_fa=f"ابزار سفارشی `{name}`",
+                    description_fa=f"  `{name}`",
                     parameters=(
                         ToolParameterSpec(
                             name="text",

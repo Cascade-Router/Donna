@@ -39,7 +39,7 @@ Output rules (non-negotiable):
    unrelated product fantasies.
 6. STRICT JSON hygiene: use only double-quoted strings. Never use Python
    triple-quotes. Keep proposed_solution_code_outline to ONE line (~40 words)
-   with \\n escapes if needed. ASCII preferred; no raw Farsi code points inside
+   with \\n escapes if needed. ASCII preferred; no raw non-ASCII code points inside
    JSON string values.
 """.strip()
 

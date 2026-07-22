@@ -309,11 +309,11 @@ def match_lessons_for_intent(
         if lesson.domain == LESSONS_DOMAIN and tid:
             # Soft match: vault / memory / type / clipboard keywords.
             keywords = {
-                "write_vault_memory": ("remember", "save", "vault", "ip", "یاد", "ذخیره"),
-                "read_vault_memory": ("recall", "saved", "memory", "یاد", "حافظه"),
-                "inject_keystrokes": ("type", "typing", "تایپ"),
-                "read_clipboard_context": ("clipboard", "copied", "کلیپ"),
-                "architect_new_tool": ("create tool", "new tool", "architect", "ابزار"),
+                "write_vault_memory": ("remember", "save", "vault", "ip", "", ""),
+                "read_vault_memory": ("recall", "saved", "memory", "", ""),
+                "inject_keystrokes": ("type", "typing", ""),
+                "read_clipboard_context": ("clipboard", "copied", ""),
+                "architect_new_tool": ("create tool", "new tool", "architect", ""),
             }
             for kw in keywords.get(tid, ()):
                 if kw in hay:

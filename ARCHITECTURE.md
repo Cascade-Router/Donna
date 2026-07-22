@@ -18,10 +18,10 @@ Offline voice agent for CAMGRASPER: wake-word → STT → native LangChain tool 
 
 ## Bilingual tool routing
 
-The **Intent Broker** (`donna/tools/broker.py`) maps spoken English/Persian into a
+The **Intent Broker** (`donna/tools/broker.py`) maps spoken English into a
 language-agnostic `ToolCall` IR for the STT fast-path and argument validation.
 
-1. **Normalize** Farsi (Yeh/Kaf, digits, ZWNJ) via `donna/tools/normalize.py`.
+1. **Normalize** text (Yeh/Kaf, digits, ZWNJ) via `donna/tools/normalize.py`.
 2. **Alias routing** — longest phrase match across EN/FA alias maps in `tools.json`.
 3. **Validate / self-correct** — enum coerce, fuzzy tool ids, drop hallucinated args.
 4. **Dispatch** — `switch_vision_source` may fast-path; most tools run inside the

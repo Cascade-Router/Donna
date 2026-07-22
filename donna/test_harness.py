@@ -322,6 +322,7 @@ async def _run_turn(graph: Any, user_text: str) -> None:
         "last_obs": "",
         "final_raw": "",
         "halt": False,
+        "always_include": [],
     }
 
     streamed_any = False

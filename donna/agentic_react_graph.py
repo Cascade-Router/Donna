@@ -12,12 +12,14 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Annotated, Any, TypedDict
+from typing import Any
 
-from langgraph.graph.message import add_messages
-
+from donna.schema import AgenticResult, ReactGraphState
 from donna.tools.broker import IntentBroker, ToolValidationError, get_broker
 from donna.tools.schema import ToolCall
+
+# Re-export for callers that import ReactGraphState from this module.
+__all__ = ("ReactGraphState", "compile_donna_react_graph", "run_react_langgraph")
 
 
 def _emit_live_trace(event_type: str, **payload: Any) -> None:
@@ -30,14 +32,23 @@ def _emit_live_trace(event_type: str, **payload: Any) -> None:
         pass
 
 
-class ReactGraphState(TypedDict):
-    """LangGraph ReAct state — messages use add_messages reducer."""
-
-    messages: Annotated[list, add_messages]
-    iterations: int
-    last_obs: str
-    final_raw: str
-    halt: bool
+def _specs_for_tool_ids(
+    tool_ids: list[str],
+    *,
+    semantic_specs: dict[str, Any],
+    broker_registry: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve ToolSpecs for an ordered id list (semantic first, then broker)."""
+    out: dict[str, Any] = {}
+    for tid in tool_ids:
+        name = str(tid or "").strip()
+        if not name or name in out:
+            continue
+        if name in semantic_specs:
+            out[name] = semantic_specs[name]
+        elif name in broker_registry:
+            out[name] = broker_registry[name]
+    return out
 
 
 def _route_after_agent(state: ReactGraphState) -> str:
@@ -109,6 +120,7 @@ async def run_react_langgraph(
     visual_context: str | None,
     model: str,
     forced_tool: ToolCall | None = None,
+    tts_callback: Callable[[str], None] | None = None,
 ) -> Any:
     """Compile + stream a MemorySaver-backed agent↔tools graph."""
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -121,6 +133,19 @@ async def run_react_langgraph(
 
     broker = broker or get_broker()
     reply_lang = resolve_reply_lang(user_text)
+
+    def _speak(phrase: str) -> None:
+        """Prefer injected TTS callback; fall back to agentic spooler helper."""
+        text = (phrase or "").strip()
+        if not text:
+            return
+        if tts_callback is not None:
+            try:
+                tts_callback(text)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        ag._enqueue_tts_nonblocking(text)
 
     prompt = system_prompt
     if ag._TOOL_EXECUTION_RULE not in prompt:
@@ -221,12 +246,26 @@ async def run_react_langgraph(
             )
         )
     )
-    top_specs = semantic.retrieve_specs(user_text, k=6, always_include=always)
-    bind_registry = top_specs if top_specs else broker.registry
+    # When the broker merge is non-empty, bind_tools must match it exactly —
+    # do not dilute/overwrite with MoA/Vision semantic top-K defaults.
+    semantic_specs = semantic.as_spec_dict()
+    if always:
+        bind_registry = _specs_for_tool_ids(
+            always,
+            semantic_specs=semantic_specs,
+            broker_registry=broker.registry,
+        )
+        tool_ids: set[str] | None = set(always)
+    else:
+        top_specs = semantic.retrieve_specs(user_text, k=6, always_include=always)
+        bind_registry = top_specs if top_specs else broker.registry
+        tool_ids = set(bind_registry.keys()) if top_specs else None
     tools = build_langchain_tools(
         execute_fn,
         registry=bind_registry,
-        tool_ids=set(bind_registry.keys()) if top_specs else None,
+        tool_ids=tool_ids,
+        tts_callback=tts_callback,
+        vault_client=vault_client,
     )
     bound_names = {getattr(t, "name", "") for t in tools}
     try:
@@ -247,12 +286,34 @@ async def run_react_langgraph(
     )
     llm_with_tools = llm.bind_tools(tools, strict=True)
 
+    def _rebind_from_always(always_ids: list[str]) -> None:
+        """Bind LLM tools strictly to the broker merge list (no mode top-K)."""
+        nonlocal tools, bound_names, llm_with_tools, bind_registry
+        ids = list(dict.fromkeys(str(x) for x in always_ids if str(x).strip()))
+        if not ids:
+            return
+        fresh = get_tool_registry().as_spec_dict()
+        bind_registry = _specs_for_tool_ids(
+            ids,
+            semantic_specs=fresh,
+            broker_registry=broker.registry,
+        )
+        tools = build_langchain_tools(
+            execute_fn,
+            registry=bind_registry,
+            tool_ids=set(ids),
+            tts_callback=tts_callback,
+            vault_client=vault_client,
+        )
+        bound_names = {getattr(t, "name", "") for t in tools}
+        llm_with_tools = llm.bind_tools(tools, strict=True)
+
     trace: list[dict[str, Any]] = []
     last_obs = ""
     tool_ack_done = False
     tts_streamed = False
 
-    def _finish(final_text: str, iterations: int) -> ag.AgenticResult:
+    def _finish(final_text: str, iterations: int) -> AgenticResult:
         from donna.reflector import trace_has_failure
 
         text = (final_text or "").strip()
@@ -360,7 +421,7 @@ async def run_react_langgraph(
             vault_client=vault_client,
             enable_reflection=enable_reflection,
         )
-        return ag.AgenticResult(
+        return AgenticResult(
             final_text=spoken,
             iterations=iterations,
             tool_trace=trace,
@@ -372,6 +433,7 @@ async def run_react_langgraph(
         )
 
     def _rebind_tools_after_forge() -> None:
+        """Refresh registry after Tool Forge, keeping broker merge binding exact."""
         nonlocal tools, bound_names, llm_with_tools, bind_registry
         semantic_fresh = get_tool_registry()
         always_ids = list(
@@ -386,12 +448,17 @@ async def run_react_langgraph(
                 )
             )
         )
+        if always_ids:
+            _rebind_from_always(always_ids)
+            return
         top = semantic_fresh.retrieve_specs(user_text, k=8, always_include=always_ids)
-        bind_registry = semantic_fresh.as_spec_dict() or top or broker.registry
+        bind_registry = top if top else broker.registry
         tools = build_langchain_tools(
             execute_fn,
             registry=bind_registry,
-            tool_ids=None,
+            tool_ids=set(bind_registry.keys()) if top else None,
+            tts_callback=tts_callback,
+            vault_client=vault_client,
         )
         bound_names = {getattr(t, "name", "") for t in tools}
         llm_with_tools = llm.bind_tools(tools, strict=True)
@@ -530,15 +597,23 @@ async def run_react_langgraph(
                 pass
 
     async def _agent_node(state: ReactGraphState) -> dict[str, Any]:
-        nonlocal llm_with_tools, last_obs
+        nonlocal llm_with_tools, last_obs, tts_streamed
         messages = list(state.get("messages") or [])
         step = int(state.get("iterations") or 0) + 1
+        # Bind from state payload — never recalculate mode defaults in the node.
+        state_always = [
+            str(x)
+            for x in (state.get("always_include") or always or [])
+            if str(x).strip()
+        ]
+        if state_always:
+            _rebind_from_always(state_always)
         _emit_live_trace(
             "node_enter",
             node="agent",
             message=f"Router/Synthesis step {step}",
             mode=ag.get_donna_mode(),
-            state_keys=("messages", "iterations"),
+            state_keys=("messages", "iterations", "always_include"),
         )
         ag.sanitize_react_message_history(messages)
         response = None
@@ -594,12 +669,19 @@ async def run_react_langgraph(
                 # (do not retry as a Titan format error or fall through to
                 # "I didn't catch that.").
                 if ag.is_ollama_connection_error(exc):
+                    try:
+                        ag.end_stream_sentence_tts()
+                    except Exception:  # noqa: BLE001
+                        pass
                     return {
                         "messages": messages,
                         "iterations": step,
                         "last_obs": last_obs,
                         "final_raw": ag.OLLAMA_UNREACHABLE_SPEECH,
                         "halt": True,
+                        "always_include": list(
+                            state.get("always_include") or always
+                        ),
                     }
                 if attempt < max_retries:
                     messages.append(
@@ -620,12 +702,17 @@ async def run_react_langgraph(
                         else "      ."
                     )
                 )
+                try:
+                    ag.end_stream_sentence_tts()
+                except Exception:  # noqa: BLE001
+                    pass
                 return {
                     "messages": messages,
                     "iterations": step,
                     "last_obs": last_obs,
                     "final_raw": fallback,
                     "halt": True,
+                    "always_include": list(state.get("always_include") or always),
                 }
 
         if response is None:
@@ -638,12 +725,17 @@ async def run_react_langgraph(
                     else "      ."
                 )
             )
+            try:
+                ag.end_stream_sentence_tts()
+            except Exception:  # noqa: BLE001
+                pass
             return {
                 "messages": messages,
                 "iterations": step,
                 "last_obs": last_obs,
                 "final_raw": fallback,
                 "halt": True,
+                "always_include": list(state.get("always_include") or always),
             }
 
         if not isinstance(response, AIMessage):
@@ -685,6 +777,7 @@ async def run_react_langgraph(
                 "last_obs": last_obs,
                 "final_raw": "",
                 "halt": False,
+                "always_include": list(state.get("always_include") or always),
             }
 
         raw = raw_stripped
@@ -707,6 +800,12 @@ async def run_react_langgraph(
                     else "  ."
                 )
             )
+        # No tool call this iteration — terminate stream TTS so idle is not held ~30s.
+        try:
+            if ag.end_stream_sentence_tts():
+                tts_streamed = True
+        except Exception:  # noqa: BLE001
+            pass
         trace.append({"step": step, "final": True})
         return {
             "messages": [response],
@@ -714,6 +813,7 @@ async def run_react_langgraph(
             "last_obs": last_obs,
             "final_raw": answer,
             "halt": True,
+            "always_include": list(state.get("always_include") or always),
         }
 
     async def _tools_node(state: ReactGraphState) -> dict[str, Any]:
@@ -839,6 +939,7 @@ async def run_react_langgraph(
                     "last_obs": last_obs,
                     "final_raw": ag._obs_fallback(last_obs, reply_lang),
                     "halt": True,
+                    "always_include": list(state.get("always_include") or always),
                 }
         if step >= max_iters:
             extracted = ag._spoken_fact_from_search_obs(str(last_obs), user_text)
@@ -856,6 +957,7 @@ async def run_react_langgraph(
                 "last_obs": last_obs,
                 "final_raw": extracted or ag._obs_fallback(last_obs, reply_lang),
                 "halt": True,
+                "always_include": list(state.get("always_include") or always),
             }
         return {
             "messages": new_msgs,
@@ -863,6 +965,7 @@ async def run_react_langgraph(
             "last_obs": last_obs,
             "final_raw": "",
             "halt": False,
+            "always_include": list(state.get("always_include") or always),
         }
 
     graph = compile_donna_react_graph(
@@ -898,6 +1001,7 @@ async def run_react_langgraph(
         "last_obs": last_obs,
         "final_raw": "",
         "halt": False,
+        "always_include": list(always),
     }
 
     final_state: dict[str, Any] = dict(inputs)
@@ -948,7 +1052,7 @@ async def run_react_langgraph(
             # Flush any buffered speech before tool-status TTS.
             ag.flush_stream_sentence_tts()
             tool_name = str(event.get("name") or "tool")
-            ag._enqueue_tts_nonblocking(ag._friendly_tool_tts(tool_name))
+            _speak(ag._friendly_tool_tts(tool_name))
             _emit_live_trace(
                 "tool_execution",
                 node="tools",
@@ -1005,9 +1109,9 @@ async def run_react_langgraph(
     except Exception:  # noqa: BLE001
         pass
 
-    # Speak any incomplete trailing clause from the stream buffer.
+    # Speak any incomplete trailing clause; always terminate the stream latch.
     try:
-        if ag.flush_stream_sentence_tts():
+        if ag.end_stream_sentence_tts():
             tts_streamed = True
     except Exception:  # noqa: BLE001
         pass

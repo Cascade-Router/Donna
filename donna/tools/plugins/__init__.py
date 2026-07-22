@@ -22,10 +22,6 @@ def _register_builtin_plugins() -> None:
         TOOL_ID as WATCHDOG_ID,
         handle_tool_call as watchdog_handler,
     )
-    from donna.tools.plugins.farsi_naming_fix import (
-        TOOL_ID as FARSI_ID,
-        handle_tool_call as farsi_handler,
-    )
     from donna.tools.plugins.file_jail_enforcer import (
         TOOL_ID as JAIL_ID,
         handle_tool_call as jail_handler,
@@ -34,8 +30,6 @@ def _register_builtin_plugins() -> None:
         TOOL_ID as KILL_WATCHDOG_ID,
         handle_tool_call as kill_watchdog_handler,
     )
-
-    _PLUGIN_HANDLERS[FARSI_ID] = farsi_handler
     _PLUGIN_HANDLERS[JAIL_ID] = jail_handler
     _PLUGIN_HANDLERS[SWARM_ID] = swarm_handler
     _PLUGIN_HANDLERS[WATCHDOG_ID] = watchdog_handler

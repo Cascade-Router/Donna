@@ -263,7 +263,7 @@ def publish_tool_to_general(
     tool_spec = ToolSpec(
         id=name,
         description_en=description,
-        description_fa=f"ابزار عمومی `{name}`",
+        description_fa=f"  `{name}`",
         parameters=(
             ToolParameterSpec(
                 name="text",

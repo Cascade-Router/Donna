@@ -90,6 +90,6 @@ def read_system_architecture() -> dict[str, Any]:
         "tools_schema_summary_text": schema_text,
         "note": (
             "Summarize for the user; do not dump raw markdown verbatim. "
-            "Translate technical concepts to Farsi when the user query is Persian."
+            "Keep technical explanations clear and concise in English."
         ),
     }

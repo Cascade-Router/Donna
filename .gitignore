@@ -34,6 +34,16 @@ build/
 dist/
 *.egg-info/
 
+# Headless / login-startup debug logs
+donna_headless.log
+start_donna.bat
+
+# Regenerable pyreverse UML dumps (do not clutter production tree)
+donna_class_uml.md
+donna_module_uml.md
+classes_Donna.*
+packages_Donna.*
+
 # Repo-rooted runtime workspace (DONNA_WORKSPACE == CAMGRASPER)
 /logs/
 /tracker/

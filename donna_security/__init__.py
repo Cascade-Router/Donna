@@ -460,14 +460,14 @@ def register_tool_schema(
         "id": name,
         "description_en": description_en
         or f"Dynamically synthesized tool `{name}` (sandbox-verified).",
-        "description_fa": f"ابزار پویا `{name}` (تأییدشده در سندباکس).",
+        "description_fa": f"  `{name}` (  ).",
         "parameters": [
             {
                 "name": param_name,
                 "type": "string",
                 "required": True,
                 "description_en": "Primary text input.",
-                "description_fa": "ورودی متنی اصلی.",
+                "description_fa": "  .",
             }
         ],
         "aliases_en": {"_intent": [name.replace("_", " "), f"run {name}"]},

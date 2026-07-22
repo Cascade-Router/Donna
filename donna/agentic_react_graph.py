@@ -40,6 +40,60 @@ class ReactGraphState(TypedDict):
     halt: bool
 
 
+def _route_after_agent(state: ReactGraphState) -> str:
+    """Conditional edge: agent → tools (tool_calls) or END (halt / final)."""
+    from langgraph.graph import END
+
+    if state.get("halt"):
+        return END
+    messages = state.get("messages") or []
+    last = messages[-1] if messages else None
+    if last is not None and getattr(last, "tool_calls", None):
+        return "tools"
+    return END
+
+
+def _route_after_tools(state: ReactGraphState) -> str:
+    """Conditional edge: tools → END (halt) or agent (continue ReAct)."""
+    from langgraph.graph import END
+
+    return END if state.get("halt") else "agent"
+
+
+def compile_donna_react_graph(
+    agent_node: Callable[..., Any],
+    tools_node: Callable[..., Any],
+    *,
+    checkpointer: Any | None = None,
+) -> Any:
+    """Compile the production ReAct StateGraph (same topology as live Donna).
+
+    Topology:
+      START → agent ─(tool_calls)→ tools ─(continue)→ agent
+                    ╲(halt/final)→ END          ╲(halt)→ END
+    """
+    from langgraph.graph import END, START, StateGraph
+
+    from donna import agentic as ag
+
+    workflow = StateGraph(ReactGraphState)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tools_node)
+    workflow.add_edge(START, "agent")
+    workflow.add_conditional_edges(
+        "agent",
+        _route_after_agent,
+        {"tools": "tools", END: END},
+    )
+    workflow.add_conditional_edges(
+        "tools",
+        _route_after_tools,
+        {"agent": "agent", END: END},
+    )
+    cp = checkpointer if checkpointer is not None else ag._react_checkpointer()
+    return workflow.compile(checkpointer=cp)
+
+
 async def run_react_langgraph(
     *,
     user_text: str,
@@ -58,7 +112,6 @@ async def run_react_langgraph(
 ) -> Any:
     """Compile + stream a MemorySaver-backed agent↔tools graph."""
     from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-    from langgraph.graph import END, START, StateGraph
 
     from donna import agentic as ag
     from donna.cascade_router import resolve_chat_model
@@ -812,28 +865,11 @@ async def run_react_langgraph(
             "halt": False,
         }
 
-    def _route_after_agent(state: ReactGraphState) -> str:
-        if state.get("halt"):
-            return END
-        messages = state.get("messages") or []
-        last = messages[-1] if messages else None
-        if last is not None and getattr(last, "tool_calls", None):
-            return "tools"
-        return END
-
-    workflow = StateGraph(ReactGraphState)
-    workflow.add_node("agent", _agent_node)
-    workflow.add_node("tools", _tools_node)
-    workflow.add_edge(START, "agent")
-    workflow.add_conditional_edges(
-        "agent", _route_after_agent, {"tools": "tools", END: END}
+    graph = compile_donna_react_graph(
+        _agent_node,
+        _tools_node,
+        checkpointer=ag._react_checkpointer(),
     )
-    workflow.add_conditional_edges(
-        "tools",
-        lambda s: END if s.get("halt") else "agent",
-        {"agent": "agent", END: END},
-    )
-    graph = workflow.compile(checkpointer=ag._react_checkpointer())
 
     config = {
         "configurable": {"thread_id": ag._REACT_THREAD_ID},

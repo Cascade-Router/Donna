@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 _log = logging.getLogger("donna.audio.tts")
@@ -13,9 +14,12 @@ _StopFn = Callable[..., None]
 _UiFn = Callable[[str], None]
 _ResetStreamFn = Callable[[], None]
 
+# Default matches core_agent.BARGE_IN_PLAYBACK_GRACE_MS (speaker-onset bleed).
+_DEFAULT_PLAYBACK_GRACE_S = 0.4
+
 
 class TtsWorker:
-    """Owns the barge-in flag and coordinates queue flush + hardware stop.
+    """Owns the barge-in flag and coordinates queue flush + hard-stop playback.
 
     Playback code registers the active ``OutputStream`` so ``interrupt()`` can
     ``abort()`` it without waiting on the writer’s ``playback_lock`` (avoids the
@@ -32,6 +36,7 @@ class TtsWorker:
         self._playback_lock = threading.Lock()
         self._playback_interruptible = True
         self._playback_active = False
+        self._playback_started_at = 0.0
         self._flush_fn: _FlushFn | None = None
         self._sd_stop_fn: _StopFn | None = None
         self._set_ui_fn: _UiFn | None = None
@@ -68,12 +73,14 @@ class TtsWorker:
         with self._playback_lock:
             self._playback_active = True
             self._playback_interruptible = bool(interruptible)
+            self._playback_started_at = time.perf_counter()
 
     def end_playback(self) -> None:
         """Clear the playback latch after audio finishes (interruptible or not)."""
         with self._playback_lock:
             self._playback_active = False
             self._playback_interruptible = True
+            self._playback_started_at = 0.0
 
     def is_playback_active(self) -> bool:
         with self._playback_lock:
@@ -85,6 +92,23 @@ class TtsWorker:
             if not self._playback_active:
                 return True
             return bool(self._playback_interruptible)
+
+    def in_playback_grace(self, *, grace_s: float | None = None) -> bool:
+        """True during the post-onset window where barge-in must stay suppressed."""
+        window = (
+            float(grace_s)
+            if grace_s is not None
+            else _DEFAULT_PLAYBACK_GRACE_S
+        )
+        if window <= 0:
+            return False
+        with self._playback_lock:
+            if not self._playback_active:
+                return False
+            started = float(self._playback_started_at or 0.0)
+        if started <= 0:
+            return False
+        return (time.perf_counter() - started) < window
 
     def play_audio(self, *, interruptible: bool = True) -> Any:
         """Context manager: ``with worker.play_audio(interruptible=False): ...``."""

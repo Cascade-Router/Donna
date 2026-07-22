@@ -45,7 +45,6 @@ import subprocess
 import sys
 import threading
 import time
-import types
 import wave
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -352,47 +351,11 @@ def download_piper_models() -> None:
             ) from exc
 
 
-# webrtcvad still does `pkg_resources.get_distribution(...).version`.
-# Always inject an importlib.metadata shim *before* importing webrtcvad so we
-# never load the deprecated real pkg_resources (avoids Setuptools UserWarning).
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
-
-_pkg = types.ModuleType("pkg_resources")
-
-
-class _Dist:
-    def __init__(self, name: str) -> None:
-        try:
-            self.version = _pkg_version(name)
-        except PackageNotFoundError:
-            self.version = "0"
-
-
-def _get_distribution(name: str) -> _Dist:
-    return _Dist(name)
-
-
-def _iter_entry_points(group: str, name: str | None = None):  # noqa: ANN202
-    from importlib.metadata import entry_points
-
-    eps = entry_points()
-    selected = eps.select(group=group) if hasattr(eps, "select") else eps.get(group, [])
-    for ep in selected:
-        if name is None or ep.name == name:
-            yield ep
-
-
-_pkg.get_distribution = _get_distribution  # type: ignore[attr-defined]
-_pkg.iter_entry_points = _iter_entry_points  # type: ignore[attr-defined]
-sys.modules["pkg_resources"] = _pkg
-
-import webrtcvad
-
 from openwakeword.model import Model as OpenWakeWordModel
 
 
 MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct"  # retained for optional future vision
-WHISPER_ID = "openai/whisper-base"
+WHISPER_ID = "distil-whisper/distil-small.en"
 # Default Whisper language; overridden at runtime from settings.json (English-first).
 WHISPER_LANGUAGE = "english"
 WHISPER_TASK = "transcribe"
@@ -458,9 +421,11 @@ WHISPER_INITIAL_PROMPT = (
 )
 # Discard transcripts denser than a realistic speaking rate (hallucinated dumps).
 WHISPER_MAX_WORDS_PER_SEC = 5.0
-# Post-STT repairs for known proper nouns Whisper-base often mangles.
+# Post-STT repairs for known proper nouns Distil-Whisper / Whisper often mangle.
 _STT_NAME_FIXES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bAmir\s*[- ]?\s*Hosein\b", re.I), "Amirhosein"),
+    (re.compile(r"\bAmir\s+Hussain\b", re.I), "Amirhosein"),
+    (re.compile(r"\bAmir\s+Hussein\b", re.I), "Amirhosein"),
     (re.compile(r"\bAMIRHOSEN\b", re.I), "Amirhosein"),
     (re.compile(r"\bAmirhos(?:e|ei|i)n\b", re.I), "Amirhosein"),
     (re.compile(r"\bAmy\s+Hors(?:e)?t\b", re.I), "Amirhosein"),
@@ -481,48 +446,42 @@ WHISPER_TARGET_RMS = 0.05
 WHISPER_GAIN_RMS_CEIL = 0.015
 WHISPER_MIN_RMS_FOR_GAIN = 0.0015
 WHISPER_MAX_GAIN = 12.0
-VAD_FRAME_MS = 30  # webrtcvad allows 10/20/30 ms
-VAD_FRAME_SAMPLES = SAMPLE_RATE * VAD_FRAME_MS // 1000  # 480 @ 16 kHz
-# Aggressiveness 3 = max webrtcvad noise rejection (cuts ambient hang faster).
-VAD_AGGRESSIVENESS = 3
-# Natural cadence: 700–800ms tolerates breathing/thinking pauses between clauses.
-VAD_SILENCE_MS = 750
-VAD_MAX_SECONDS = 60.0  # absolute failsafe timeout (initial wake turn)
+# Silero VAD window @ 16 kHz (512 samples ≈ 32 ms).
+VAD_FRAME_SAMPLES = 512
+VAD_FRAME_MS = int(round(1000.0 * VAD_FRAME_SAMPLES / SAMPLE_RATE))
+# Natural cadence: 1.5s tolerates conversational mid-sentence pauses.
+VAD_SILENCE_MS = 1500
+VAD_MAX_SECONDS = 10.0  # initial wake failsafe (empty-room timeout)
 FOLLOWUP_VAD_MAX_SECONDS = 9.0  # silence timeout while waiting for a follow-up
-# Was 300ms / 10 frames — quiet headsets only scored ~3 speech frames, so silence
-# cutoff never fired and every turn waited for max_timeout.
 VAD_MIN_SPEECH_MS = 120
-VAD_PRE_ROLL_FRAMES = 10  # keep ~300 ms before speech onset
-# After short wake ack ("Yes?"): thin echo discard only — do not eat the user's first word.
-POST_ACK_SETTLE_SEC = 0.05
-POST_ACK_FLUSH_SEC = 0.08
-POST_ACK_IGNORE_ONSET_MS = 60.0
+VAD_PRE_ROLL_FRAMES = 10  # keep ~320 ms before speech onset @ 32 ms frames
+# After short wake ack ("Yes?"): let speakers clear, then discard queued echo frames.
+POST_ACK_VAD_GRACE_SEC = 0.6
+POST_ACK_SETTLE_SEC = POST_ACK_VAD_GRACE_SEC
+POST_ACK_FLUSH_SEC = POST_ACK_VAD_GRACE_SEC
+POST_ACK_IGNORE_ONSET_MS = 200.0  # residual onset ignore after grace/flush
 FOLLOWUP_FLUSH_SEC = 0.05
-# Default speech energy floor — raised to ignore keyboard typing / rustle.
-VAD_QUIET_MIC_SPEECH_RMS = 0.0080
-# Hard minimum for speech_rms (keyboard / desk noise rejection).
-VAD_SPEECH_RMS_FLOOR = 0.0080
-# webrtcvad hits also need energy so hush doesn't look like speech.
-VAD_MIN_FRAME_RMS = 0.0015
-# Acoustic Shadow — absolute packet drop floor before Whisper (quiet-room guard).
-ACOUSTIC_SHADOW_FLOOR = 0.0020
 # First-order DC blocker pole (closer to 1.0 = lower cutoff). ~0.995 @ 16 kHz
 # removes mic DC offset / rumble that otherwise keeps VAD from silence_cutoff.
 DC_BLOCKER_R = 0.995
-# Barge-in while Donna speaks: must clear TTS speaker-bleed (logs hit 0.10–0.25).
-BARGE_IN_RMS = 0.12
+# Barge-in while Donna speaks: Silero probability (not raw RMS) gates interrupt.
+BARGE_IN_RMS = 0.12  # retained for adaptive helpers / logging only
 BARGE_IN_MIN_SPEECH_MS = 350.0
-BARGE_IN_SETTLE_MS = 700.0  # ignore speaker bleed at TTS start
+# Suppress barge-in for the first 400ms after TtsWorker begins a play turn
+# (speaker pop / room echo at playback onset).
+BARGE_IN_PLAYBACK_GRACE_MS = 400.0
+BARGE_IN_SETTLE_MS = BARGE_IN_PLAYBACK_GRACE_MS
 BARGE_IN_CHUNK_MS = 50.0  # TTS write chunk size (interrupt granularity)
 BARGE_IN_AMBIENT_MULT = 80.0  # threshold >= ambient_rms * this
-# Sharp RMS spike for stream-barge (wakeword path during TTS) — slightly below speech barge.
+# Stream barge-in: require strong Silero speech for N consecutive frames (~128ms).
+BARGE_IN_SILERO_THRESHOLD = 0.85
+BARGE_IN_SILERO_CONSEC_FRAMES = 4
+# Sharp RMS spike retained as diagnostic floor only (not used to interrupt).
 STREAM_BARGE_RMS = 0.09
 MIC_AMBIENT_DEAD_RMS = 1e-4  # probe below this → soft gain / adaptive floors
 # TTS recovery: max wait for queue drain; hard cap per Piper utterance (synth+play).
 TTS_IDLE_WAIT_TIMEOUT = 12.0
 TTS_UTTERANCE_MAX_SECONDS = TTS_IDLE_WAIT_TIMEOUT + 6.0
-# Below this, do not run Whisper (amplified silence → gibberish transcripts).
-STT_MIN_RMS = 0.0020
 MIN_SPEECH_RMS = 0.01  # after peak-normalize; reject near-silence hallucinations
 WAKEWORD_MODELS = ["donna"]
 AUDIO_INPUT_DEVICE: Optional[int] = None  # resolved at startup
@@ -2516,6 +2475,7 @@ def wake_phrase_confirmed(audio_16k: np.ndarray) -> bool:
             max_new_tokens=32,
             language="english",
             task="transcribe",
+            model=model,
         )
         with torch.no_grad():
             generated_ids = model.generate(
@@ -2857,10 +2817,11 @@ def load_vlm(local_files_only: bool, device, dtype):
 
 
 def load_whisper(local_files_only: bool, device):
-    # Latency path: Whisper on cuda:0 FP16 (3B LLM leaves enough VRAM headroom).
+    # Latency path: Distil-Whisper on cuda:0 FP16 (3B LLM leaves enough VRAM headroom).
     import torch
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
+    _ = local_files_only  # Prefer cache first; download only on OSError miss.
     _ = device
     if torch.cuda.is_available():
         whisper_device = torch.device("cuda:0")
@@ -2870,19 +2831,33 @@ def load_whisper(local_files_only: bool, device):
         whisper_dtype = torch.float32
     log(
         "Conversation",
-        f"Loading {WHISPER_ID} (local_files_only={local_files_only}, "
+        f"Loading {WHISPER_ID} (local_files_only=True first, "
         f"device={whisper_device}, dtype={whisper_dtype})...",
     )
     t0 = time.perf_counter()
-    processor = AutoProcessor.from_pretrained(
-        WHISPER_ID,
-        local_files_only=local_files_only,
-    )
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        WHISPER_ID,
-        dtype=whisper_dtype,
-        local_files_only=local_files_only,
-    ).to(whisper_device)
+
+    def _load_pair(*, files_only: bool):
+        proc = AutoProcessor.from_pretrained(
+            WHISPER_ID,
+            local_files_only=files_only,
+        )
+        mdl = AutoModelForSpeechSeq2Seq.from_pretrained(
+            WHISPER_ID,
+            dtype=whisper_dtype,
+            local_files_only=files_only,
+        ).to(whisper_device)
+        return proc, mdl
+
+    try:
+        processor, model = _load_pair(files_only=True)
+    except OSError as exc:
+        log(
+            "Conversation",
+            f"{WHISPER_ID} not in local cache ({exc}); "
+            "falling back to download (local_files_only=False)...",
+        )
+        processor, model = _load_pair(files_only=False)
+
     model.eval()
     # Prefer max_new_tokens-only length control. Whisper configs ship with
     # max_length=448; leaving both set triggers transformers warnings.
@@ -2914,22 +2889,38 @@ def _sanitize_whisper_generation_config(model: Any) -> None:
             pass
 
 
+def _whisper_is_english_only(model: Any | None = None) -> bool:
+    """True for *.en Distil/Whisper checkpoints that reject language/task kwargs."""
+    if model is not None:
+        gc = getattr(model, "generation_config", None)
+        if gc is not None and getattr(gc, "is_multilingual", None) is False:
+            return True
+        if getattr(model, "is_multilingual", None) is False:
+            return True
+    mid = str(WHISPER_ID or "").lower()
+    return mid.endswith(".en")
+
+
 def _whisper_generate_kwargs(
     *,
     max_new_tokens: int,
     language: str,
     task: str,
+    model: Any | None = None,
 ) -> dict[str, Any]:
     """Generation kwargs for Whisper STT — max_new_tokens only, no logits_processor."""
-    return {
+    kwargs: dict[str, Any] = {
         "max_new_tokens": int(max_new_tokens),
-        "language": language,
-        "task": task,
         "condition_on_prev_tokens": False,
         # Intentionally omitted: max_length, logits_processor, suppress_tokens,
         # begin_suppress_tokens — transformers builds SuppressTokens* processors
         # from generation_config; passing them again duplicates and warns.
     }
+    # English-only Distil-Whisper raises if language/task are set.
+    if not _whisper_is_english_only(model):
+        kwargs["language"] = language
+        kwargs["task"] = task
+    return kwargs
 
 
 def ensure_whisper_bundle(timeout: float = 180.0):
@@ -2975,9 +2966,8 @@ def start_whisper_background_load(local_files_only: bool, device) -> None:
                 )
         except OSError as exc:
             _whisper_load_error = (
-                "Whisper weights not found locally. "
-                "Connect to the internet and run once with: python agent.py --download "
-                f"({exc})"
+                f"Whisper weights unavailable for {WHISPER_ID} "
+                f"(cache miss and download failed): {exc}"
             )
             log("Conversation", f"ERROR: {_whisper_load_error}")
             stop_event.set()
@@ -3811,18 +3801,6 @@ def mic_ingest_worker() -> None:
     log("MicIngest", "Producer stopped.")
 
 
-def adaptive_vad_speech_rms() -> float:
-    """Frame RMS floor for counting speech — Acoustic Shadow + ambient adapt."""
-    ambient = float(_mic_ambient_rms or 0.0)
-    if ambient > 0.0 and ambient < MIC_AMBIENT_DEAD_RMS:
-        # Quiet headset: allow a slightly softer floor, but never below VAD_SPEECH_RMS_FLOOR.
-        floor = max(VAD_MIN_FRAME_RMS, min(VAD_QUIET_MIC_SPEECH_RMS, ambient * 25.0))
-    else:
-        floor = VAD_QUIET_MIC_SPEECH_RMS
-    # Never admit packets softer than the speech / Acoustic Shadow floors into Whisper.
-    return max(float(floor), ACOUSTIC_SHADOW_FLOOR, VAD_SPEECH_RMS_FLOOR)
-
-
 def adaptive_barge_in_rms() -> float:
     """Dynamic barge-in gate: absolute floor + multiple of ambient (filters TTS bleed)."""
     ambient = float(_mic_ambient_rms or 0.0)
@@ -3835,27 +3813,35 @@ def record_utterance(
     ignore_onset_ms: float = 0.0,
 ) -> tuple[np.ndarray, float, str, bool]:
     """
-    Capture speech with WebRTC VAD; stop shortly after the user finishes talking.
+    Capture speech with Silero VAD; stop shortly after the user finishes talking.
 
     ``ignore_onset_ms`` skips early VAD hits (TTS echo / buffer tail after ack).
 
     Returns (audio_16k, rms_raw, stop_reason, speech_started).
     """
-    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-    frame_bytes = VAD_FRAME_SAMPLES * 2  # int16 mono
+    from donna.audio.vad_consumer import (
+        SILERO_SPEECH_THRESHOLD,
+        is_speech_frame,
+        reset_silero_states,
+    )
+
     silence_needed = max(1, int(round(VAD_SILENCE_MS / VAD_FRAME_MS)))
     min_speech_frames = max(1, int(round(VAD_MIN_SPEECH_MS / VAD_FRAME_MS)))
     limit_s = float(VAD_MAX_SECONDS if max_seconds is None else max_seconds)
     max_frames = max(1, int(limit_s * 1000 / VAD_FRAME_MS))
     ignore_onset_frames = max(0, int(round(float(ignore_onset_ms) / VAD_FRAME_MS)))
-    speech_rms_floor = adaptive_vad_speech_rms()
     barge_rms_floor = adaptive_barge_in_rms()
+
+    try:
+        reset_silero_states()
+    except Exception as exc:  # noqa: BLE001
+        log("Conversation", f"WARNING: Silero VAD reset failed ({exc})")
 
     log(
         "Conversation",
-        f"VAD recording (queue consumer @16 kHz, frame={VAD_FRAME_MS}ms, "
+        f"VAD recording (Silero queue consumer @16 kHz, frame={VAD_FRAME_MS}ms, "
         f"silence_cut={VAD_SILENCE_MS}ms, max={limit_s:.0f}s, "
-        f"aggressiveness={VAD_AGGRESSIVENESS}, speech_rms>={speech_rms_floor:.4f})...",
+        f"speech_prob>{SILERO_SPEECH_THRESHOLD})...",
     )
 
     collected: list[np.ndarray] = []
@@ -3874,7 +3860,7 @@ def record_utterance(
         """Return True when recording should stop."""
         nonlocal speech_started, silence_frames, speech_frames, stop_reason, barge_frames
 
-        # DC-block BEFORE VAD energy / webrtcvad so offset cannot fake speech.
+        # DC-block before Silero so offset cannot inflate probabilities.
         samples_16k = dc_blocker.apply(samples_16k)
 
         if samples_16k.size < VAD_FRAME_SAMPLES:
@@ -3884,25 +3870,12 @@ def record_utterance(
         elif samples_16k.size > VAD_FRAME_SAMPLES:
             samples_16k = samples_16k[:VAD_FRAME_SAMPLES]
 
-        pcm = np.clip(samples_16k * 32767.0, -32768, 32767).astype(np.int16)
-        pcm_bytes = pcm.tobytes()
-        if len(pcm_bytes) != frame_bytes:
-            log(
-                "Conversation",
-                f"WARNING: unexpected PCM size {len(pcm_bytes)} (want {frame_bytes})",
-            )
-            return False
-
         frame_rms = float(np.sqrt(np.mean(np.square(samples_16k))) + 1e-12)
-        # Acoustic Shadow / hard RMS gate: room noise must NEVER count as speech.
-        if frame_rms < speech_rms_floor or frame_rms < ACOUSTIC_SHADOW_FLOOR:
+        try:
+            is_speech = bool(is_speech_frame(samples_16k, sample_rate=SAMPLE_RATE))
+        except Exception as exc:  # noqa: BLE001
+            log("Conversation", f"WARNING: Silero VAD frame error: {exc}")
             is_speech = False
-        else:
-            try:
-                is_speech = bool(vad.is_speech(pcm_bytes, SAMPLE_RATE))
-            except Exception as exc:  # noqa: BLE001
-                log("Conversation", f"WARNING: VAD frame error: {exc}")
-                is_speech = False
 
         if not speech_started:
             pre_roll.append(samples_16k.copy())
@@ -3910,7 +3883,6 @@ def record_utterance(
                 pre_roll.pop(0)
 
             # Barge-in: user talks over Donna → cut TTS and start capturing now.
-            # Adaptive floor filters speaker bleed that used to trip at ~0.05–0.10.
             # UI acknowledgments (Yes?, mode acks) are uninterruptible — ignore onset.
             if (
                 tts_busy.is_set()
@@ -4111,6 +4083,7 @@ def transcribe_audio(
         max_new_tokens=128,
         language=whisper_lang,
         task=WHISPER_TASK,
+        model=whisper_model,
     )
     with torch.no_grad():
         generated_ids = whisper_model.generate(
@@ -5577,19 +5550,19 @@ def conversation_worker(
                     if not speech_started:
                         end_session_to_idle()
                         break
-                    if rms_raw < STT_MIN_RMS:
-                        log(
-                            "Conversation",
-                            f"Follow-up too quiet for STT (rms_raw={rms_raw:.5f})",
-                        )
-                        end_session_to_idle("Standing by.")
-                        break
                 else:
-                    # Initial wake turn: ack on audio_worker; open VAD immediately
-                    # (do not wait for TTS — onset ignored while tts_busy).
+                    # Initial wake turn: non-blocking "Yes?", then grace so VAD does
+                    # not eat speaker bleed (conversation worker only — not UI thread).
                     log("Conversation", 'Acknowledging wake -> "Yes?" (non-blocking TTS)')
                     enqueue_speech("Yes?", interruptible=False)
                     set_ui_state("listening")
+                    log(
+                        "Conversation",
+                        f"Post-ack VAD grace {POST_ACK_VAD_GRACE_SEC:.2f}s "
+                        f"(flush echo, max_timeout={VAD_MAX_SECONDS:.0f}s)",
+                    )
+                    time.sleep(POST_ACK_VAD_GRACE_SEC)
+                    flush_input_buffer(POST_ACK_FLUSH_SEC)
                     try:
                         audio, rms_raw, stop_reason, speech_started = record_utterance(
                             max_seconds=VAD_MAX_SECONDS,
@@ -5618,17 +5591,6 @@ def conversation_worker(
                             "Conversation",
                             "No VAD onset after wake — re-listening once "
                             f"(rms_raw={rms_raw:.5f}, reason={stop_reason})",
-                        )
-                        enqueue_speech("I'm here.", interruptible=False)
-                        wait_for_speech_idle(timeout=8.0)
-                        follow_up = True
-                        set_ui_state("followup")
-                        continue
-                    if rms_raw < STT_MIN_RMS:
-                        log(
-                            "Conversation",
-                            f"Wake capture too quiet for STT (rms_raw={rms_raw:.5f}) "
-                            "— re-listening once",
                         )
                         enqueue_speech("I'm here.", interruptible=False)
                         wait_for_speech_idle(timeout=8.0)
@@ -6100,22 +6062,21 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
 
     Abort TTS when:
       * wake-word ("Donna") scores above threshold, OR
-      * a sharp RMS volume spike clears the stream-barge floor, OR
-      * sustained VAD speech onset (classic barge-in).
+      * sustained Silero speech onset (classic barge-in).
 
-    Stands down when ``record_utterance`` already owns the mic queue, or when
-    the active utterance is an uninterruptible UI acknowledgment.
+    Stands down when ``record_utterance`` already owns the mic queue, when the
+    active utterance is an uninterruptible UI acknowledgment, or during the
+    post-playback-onset grace window (speaker pop / room echo).
     """
     if vad_capture_active.is_set():
         return
     if not _tts_barge.is_playback_interruptible():
         return
 
-    settle_s = BARGE_IN_SETTLE_MS / 1000.0
-    if settle_s > 0:
-        # Wait for TTS to begin so speaker bleed does not self-interrupt.
-        deadline = time.perf_counter() + settle_s
-        while time.perf_counter() < deadline:
+    grace_s = BARGE_IN_PLAYBACK_GRACE_MS / 1000.0
+    if grace_s > 0:
+        # Wait out TtsWorker playback-onset grace so speaker bleed cannot cut TTS.
+        while _tts_barge.in_playback_grace(grace_s=grace_s):
             if (
                 stop_flag.is_set()
                 or stop_event.is_set()
@@ -6134,10 +6095,12 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
     # Drop frames accumulated while wake-word was idle during TTS settle.
     flush_audio_buffer_queue()
 
-    need_frames = max(1, int(round(BARGE_IN_MIN_SPEECH_MS / VAD_FRAME_MS)))
-    barge_rms_floor = adaptive_barge_in_rms()
-    spike_floor = max(STREAM_BARGE_RMS, barge_rms_floor)
-    vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+    from donna.audio.vad_consumer import reset_silero_states, speech_probability
+
+    try:
+        reset_silero_states()
+    except Exception:  # noqa: BLE001
+        pass
     dc = DcBlocker(r=DC_BLOCKER_R)
     oww = _shared_wakeword_model
     wake_token = (_shared_wakeword_token or "donna").lower()
@@ -6151,6 +6114,11 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
             and not vad_capture_active.is_set()
         ):
             if get_ui_state() != "speaking":
+                consec = 0
+                time.sleep(0.01)
+                continue
+            # Re-check grace (covers begin_playback restart mid-watcher).
+            if _tts_barge.in_playback_grace(grace_s=grace_s):
                 consec = 0
                 time.sleep(0.01)
                 continue
@@ -6194,41 +6162,30 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
                 flush_audio_buffer_queue()
                 return
 
-            if rms >= spike_floor:
-                log(
-                    "BargeIn",
-                    f"RMS spike stream-barge (rms={rms:.4f}, "
-                    f"gate={spike_floor:.4f}) — interrupting TTS",
-                )
-                from donna.audio.vad_consumer import trigger_tts_barge_in
-
-                trigger_tts_barge_in(
-                    reason=f"rms_spike rms={rms:.4f} gate={spike_floor:.4f}"
-                )
-                flush_audio_buffer_queue()
-                return
-
-            if rms < barge_rms_floor:
-                consec = 0
-                continue
+            # Silero-only speech barge-in (no raw RMS interrupt — avoids mic spikes).
             try:
-                is_speech = bool(vad.is_speech(pcm.tobytes(), SAMPLE_RATE))
+                speech_prob = float(
+                    speech_probability(samples, sample_rate=SAMPLE_RATE)
+                )
             except Exception:
-                is_speech = rms >= barge_rms_floor
-            if is_speech:
+                speech_prob = 0.0
+            if speech_prob > BARGE_IN_SILERO_THRESHOLD:
                 consec += 1
-                if consec >= need_frames:
+                if consec >= BARGE_IN_SILERO_CONSEC_FRAMES:
                     log(
                         "BargeIn",
-                        f"Speech onset while speaking (rms={rms:.4f}, "
-                        f"gate={barge_rms_floor:.4f}) — interrupting TTS",
+                        f"Speech onset while speaking "
+                        f"(silero_prob={speech_prob:.3f}, "
+                        f"thresh={BARGE_IN_SILERO_THRESHOLD}, "
+                        f"frames={consec}, rms={rms:.4f}) — interrupting TTS",
                     )
                     from donna.audio.vad_consumer import trigger_tts_barge_in
 
                     trigger_tts_barge_in(
                         reason=(
-                            f"speech_onset rms={rms:.4f} "
-                            f"gate={barge_rms_floor:.4f}"
+                            f"speech_onset silero_prob={speech_prob:.3f} "
+                            f"thresh={BARGE_IN_SILERO_THRESHOLD} "
+                            f"frames={consec}"
                         )
                     )
                     flush_audio_buffer_queue()
@@ -7378,7 +7335,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Allow Hugging Face / OpenWakeWord to download/cache model weights (online). "
-            "Omit this flag for strictly offline HF loads (local_files_only=True)."
+            "Omit for offline HF loads where supported. Distil-Whisper STT still "
+            "auto-falls back to download on a local cache miss."
         ),
     )
     parser.add_argument(

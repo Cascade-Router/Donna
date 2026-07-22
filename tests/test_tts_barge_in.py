@@ -58,6 +58,21 @@ def test_tts_worker_skips_chunk_when_barge_latched() -> None:
     print("[PASS] barge latch consume/clear for next spool item")
 
 
+def test_playback_grace_suppresses_onset_window() -> None:
+    """First 400ms after begin_playback must report in_playback_grace."""
+    worker = TtsWorker()
+    worker.begin_playback(interruptible=True)
+    assert worker.in_playback_grace(grace_s=0.4) is True
+    time.sleep(0.45)
+    assert worker.in_playback_grace(grace_s=0.4) is False
+    worker.end_playback()
+    assert worker.in_playback_grace(grace_s=0.4) is False
+    assert donna.BARGE_IN_SILERO_THRESHOLD == 0.85
+    assert donna.BARGE_IN_SILERO_CONSEC_FRAMES == 4
+    assert donna.BARGE_IN_PLAYBACK_GRACE_MS == 400.0
+    print("[PASS] playback grace + hardened Silero barge thresholds")
+
+
 def test_active_stream_abort_on_interrupt() -> None:
     stream = MagicMock()
     worker = get_tts_worker(barge_in_event=donna.tts_interrupt_event)

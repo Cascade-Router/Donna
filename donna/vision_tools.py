@@ -180,18 +180,49 @@ def format_vision_payload(detections: list[dict[str, Any]]) -> str:
 
 
 def analyze_visual_context(source: str = "screen") -> str:
-    """Capture a frame, run JIT YOLO, return a clean text payload for the LLM.
+    """Analyze vision via Tracker rolling buffer (fallback: one cold capture).
 
-    Args:
-        source: ``\"screen\"`` (mss primary monitor) or ``\"webcam\"`` / ``\"camera\"``.
+    Prefers the latest frame from ``donna.tracker``'s maxlen-5 buffer so the
+    agent gets temporal context without triggering a fresh screenshot when the
+    Tracker is already sampling ``active_vision_tool``.
     """
     kind = str(source or "screen").strip().lower() or "screen"
-    if kind in {"webcam", "camera", "video"}:
-        frame = capture_webcam_frame()
-        source_label = "webcam"
-    else:
-        frame = capture_screen_frame()
-        source_label = "screen"
+    source_label = "webcam" if kind in {"webcam", "camera", "video"} else "screen"
+
+    frame = None
+    temporal_n = 0
+    monitor = None
+    try:
+        from donna.tracker import (
+            get_latest_buffered_frame,
+            get_latest_sample,
+            get_temporal_context,
+        )
+
+        ctx = get_temporal_context()
+        temporal_n = int(ctx.get("count") or 0)
+        sample = get_latest_sample()
+        if sample is not None:
+            # Prefer buffer frames that match the requested source when possible.
+            src = str(sample.source or "").lower()
+            if source_label == "webcam" and src in {"camera", "webcam", "video"}:
+                frame = sample.frame.copy()
+                monitor = sample.monitor
+            elif source_label == "screen" and src in {"screen", ""}:
+                frame = sample.frame.copy()
+                monitor = sample.monitor
+            elif temporal_n > 0 and source_label == "screen":
+                # Screen queries may still use the latest buffer sample.
+                frame = get_latest_buffered_frame()
+                monitor = sample.monitor
+    except Exception:  # noqa: BLE001
+        frame = None
+
+    if frame is None:
+        if source_label == "webcam":
+            frame = capture_webcam_frame()
+        else:
+            frame = capture_screen_frame()
 
     if frame is None:
         return f"[Vision Output] Detected: nothing (no {source_label} frame)."
@@ -203,7 +234,32 @@ def analyze_visual_context(source: str = "screen") -> str:
         return f"[Vision Output] Detected: nothing (YOLO error: {exc})."
 
     detections = _detections_from_results(results)
-    return format_vision_payload(detections)
+
+    # Drive the live ROI overlay from agent attention (top detection).
+    if detections and source_label == "screen":
+        try:
+            from donna.tracker import map_box_to_screen
+            from donna.vision.overlay import update_roi
+
+            best = max(detections, key=lambda d: float(d.get("confidence") or 0.0))
+            xyxy = best.get("xyxy")
+            name = str(best.get("name") or "object")
+            shape = getattr(frame, "shape", None)
+            fw = int(shape[1]) if shape is not None and len(shape) >= 2 else FRAME_SIZE[0]
+            fh = int(shape[0]) if shape is not None and len(shape) >= 2 else FRAME_SIZE[1]
+            screen_box = map_box_to_screen(xyxy, frame_wh=(fw, fh), monitor=monitor)
+            if screen_box is not None:
+                update_roi(screen_box, name)
+        except Exception:  # noqa: BLE001
+            pass
+
+    payload = format_vision_payload(detections)
+    if temporal_n > 1:
+        payload = (
+            f"{payload} "
+            f"[Temporal: {temporal_n} buffered frames @ ~2s]."
+        )
+    return payload
 
 
 # ---------------------------------------------------------------------------

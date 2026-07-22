@@ -2,7 +2,7 @@
 CAMGRASPER - Offline Voice-to-Voice Donna assistant.
 
 Pipeline (4 threads + agent keep-alive loop + GUI main thread):
-  1. Tracker   - YOLOv8n on active_vision_tool.get_frame() (~10 FPS)
+  1. Tracker   - YOLOv8n rolling buffer (~2s) from active_vision_tool + live ROI overlay
   2. WakeWord  - OpenWakeWord custom "donna.onnx" on mic @ 16 kHz
   3. Conversation - VAD -> Whisper STT -> tool_router -> YOLO + Ollama LLM -> TTS
   4. Audio     - offline TTS via piper-tts (en_US HFC female)
@@ -363,7 +363,9 @@ YOLO_WEIGHTS = str(YOLO_WEIGHTS_PATH)
 FRAME_SIZE = (640, 480)  # (width, height)
 MAX_NEW_TOKENS = 50  # legacy SmolVLM cap (unused in Ollama cascade)
 YOLO_CONF = 0.35
-TRACKER_SLEEP_SEC = 0.1
+# Tracker samples active_vision_tool into a maxlen-5 buffer every ~2s (low CPU).
+TRACKER_SLEEP_SEC = 0.25
+TRACKER_BUFFER_INTERVAL_S = 2.0
 
 # Local Ollama conversational brain
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -2315,17 +2317,39 @@ def tracker_worker(device) -> None:
     _nt_hide_console_if_mp_child()
     global latest_frame, latest_dets
 
-    from donna.tracker import get_yolo_model, yolo_is_loaded
+    from donna.tracker import (
+        FRAME_BUFFER_INTERVAL_S,
+        get_yolo_model,
+        map_box_to_screen,
+        primary_monitor_geometry,
+        push_frame,
+        should_push_frame,
+        seconds_since_last_push,
+        yolo_is_loaded,
+    )
 
     log(
         "Tracker",
         f"Idle (JIT YOLO) — will load {YOLO_WEIGHTS} on Vision mode or first detect.",
     )
     yolo_dev = yolo_device_arg(device)
-    log("Tracker", f"Pulling frames from active_vision_tool.get_frame() (on-demand).")
+    buf_interval = float(TRACKER_BUFFER_INTERVAL_S or FRAME_BUFFER_INTERVAL_S)
+    log(
+        "Tracker",
+        f"Rolling buffer every {buf_interval:.1f}s from "
+        f"active_vision_tool.get_frame() (maxlen=5).",
+    )
 
     frames = 0
     while not stop_event.is_set():
+        # Wait out the ~2s cadence before grabbing (avoids busy mss polling).
+        if not should_push_frame(interval_s=buf_interval):
+            rem = buf_interval - seconds_since_last_push()
+            if rem == float("inf"):
+                rem = 0.0
+            time.sleep(max(0.05, min(TRACKER_SLEEP_SEC, max(0.0, rem))))
+            continue
+
         with active_vision_lock:
             tool = active_vision_tool
         tool_name = "camera" if tool is camera_tool else "screen"
@@ -2344,49 +2368,92 @@ def tracker_worker(device) -> None:
         with latest_frame_lock:
             latest_frame = frame
 
-        # JIT: skip YOLO until Vision mode is active or the model was already warmed
-        # by an explicit conversation-side detect.
         try:
             mode = get_donna_mode()
         except Exception:  # noqa: BLE001
             mode = "chat"
-        if mode != "vision" and not yolo_is_loaded():
-            time.sleep(TRACKER_SLEEP_SEC)
-            continue
 
-        try:
-            yolo = get_yolo_model(YOLO_WEIGHTS)
-            results = yolo.predict(
-                source=frame,
-                conf=YOLO_CONF,
-                device=yolo_dev,
-                verbose=False,
+        run_yolo = mode == "vision" or yolo_is_loaded()
+        monitor = primary_monitor_geometry() if tool_name == "screen" else None
+
+        dets: list = []
+        labels: list[str] = []
+        if run_yolo:
+            try:
+                yolo = get_yolo_model(YOLO_WEIGHTS)
+                results = yolo.predict(
+                    source=frame,
+                    conf=YOLO_CONF,
+                    device=yolo_dev,
+                    verbose=False,
+                )
+                _, dets = parse_yolo_results(results)
+            except Exception as exc:  # noqa: BLE001
+                log("Tracker", f"WARNING: YOLO predict failed: {exc}")
+                dets = []
+
+            with latest_dets_lock:
+                latest_dets = dets
+
+            labels = [name for _, name, _ in dets]
+            remember_spatial_labels(labels)
+            SPATIAL_AGGREGATOR.set_vision_source(tool_name)
+            SPATIAL_AGGREGATOR.update_from_dets(
+                dets, frame_shape=getattr(frame, "shape", None)
             )
-            _, dets = parse_yolo_results(results)
-        except Exception as exc:  # noqa: BLE001
-            log("Tracker", f"WARNING: YOLO predict failed: {exc}")
-            time.sleep(0.05)
-            continue
 
-        with latest_dets_lock:
-            latest_dets = dets
+            if dets and tool_name == "screen":
+                try:
+                    from donna.vision.overlay import update_roi
 
-        labels = [name for _, name, _ in dets]
-        remember_spatial_labels(labels)
-        SPATIAL_AGGREGATOR.set_vision_source(tool_name)
-        SPATIAL_AGGREGATOR.update_from_dets(dets, frame_shape=getattr(frame, "shape", None))
+                    best = max(dets, key=lambda d: float(d[2]))
+                    xyxy, label, _conf = best
+                    shape = getattr(frame, "shape", None)
+                    fw = (
+                        int(shape[1])
+                        if shape is not None and len(shape) >= 2
+                        else FRAME_SIZE[0]
+                    )
+                    fh = (
+                        int(shape[0])
+                        if shape is not None and len(shape) >= 2
+                        else FRAME_SIZE[1]
+                    )
+                    screen_box = map_box_to_screen(
+                        xyxy, frame_wh=(fw, fh), monitor=monitor
+                    )
+                    if screen_box is not None:
+                        update_roi(screen_box, label)
+                except Exception as exc:  # noqa: BLE001
+                    log_debug("Tracker", f"ROI overlay update skipped ({exc})")
+
+        push_frame(
+            frame,
+            source=tool_name,
+            dets=list(dets),
+            monitor=monitor,
+            force=True,
+        )
 
         frames += 1
-        # Heartbeat ~every 30s (300 frames * 0.1s) — debug-only by default cadence.
-        if frames % 300 == 0:
+        if frames % 15 == 0:
+            from donna.tracker import buffer_len
+
             log_debug(
                 "Tracker",
-                f"Alive - {frames} tracks via {tool_name}; last=[{format_class_list(labels)}]",
+                f"Alive - {frames} samples via {tool_name}; "
+                f"buffer={buffer_len()}/5; last=[{format_class_list(labels)}]",
             )
 
         time.sleep(TRACKER_SLEEP_SEC)
 
     log("Tracker", "Stopped.")
+    try:
+        from donna.vision.overlay import clear_roi
+
+        clear_roi()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------

@@ -67,10 +67,33 @@ def test_playback_grace_suppresses_onset_window() -> None:
     assert worker.in_playback_grace(grace_s=0.4) is False
     worker.end_playback()
     assert worker.in_playback_grace(grace_s=0.4) is False
-    assert donna.BARGE_IN_SILERO_THRESHOLD == 0.85
-    assert donna.BARGE_IN_SILERO_CONSEC_FRAMES == 4
     assert donna.BARGE_IN_PLAYBACK_GRACE_MS == 400.0
-    print("[PASS] playback grace + hardened Silero barge thresholds")
+    print("[PASS] playback grace window")
+
+
+def test_half_duplex_mic_drop_does_not_interrupt() -> None:
+    """While TTS is busy, half-duplex drop must flush mic and never latch barge-in."""
+    donna._bind_tts_barge_controller()
+    donna.tts_interrupt_event.clear()
+    donna.stop_event.clear()
+    donna.tts_busy.set()
+    donna.vad_capture_active.clear()
+    donna._tts_barge.begin_playback(interruptible=True)
+    # Poison the mic queue with "speech-like" frames.
+    for _ in range(8):
+        donna.audio_buffer_queue.put_nowait(np.ones(donna.VAD_FRAME_SAMPLES, dtype=np.float32) * 0.2)
+    stop_flag = threading.Event()
+
+    def _stop_soon() -> None:
+        time.sleep(0.15)
+        donna.tts_busy.clear()
+        stop_flag.set()
+
+    threading.Thread(target=_stop_soon, daemon=True).start()
+    donna.half_duplex_mic_drop(stop_flag)
+    assert not donna.tts_interrupt_event.is_set()
+    donna._tts_barge.end_playback()
+    print("[PASS] half-duplex mic drop does not interrupt TTS")
 
 
 def test_active_stream_abort_on_interrupt() -> None:

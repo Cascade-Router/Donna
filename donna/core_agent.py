@@ -2680,8 +2680,8 @@ def wakeword_worker() -> None:
             time.sleep(0.1)
             continue
 
-        # Yield consumption while TTS / VAD / turn owns the audio queue.
-        # Stream-barging during TTS is owned by barge_in_watch (same queue).
+        # Yield while TTS / VAD / turn owns the audio queue (half-duplex:
+        # mic frames during TTS are discarded by half_duplex_mic_drop).
         if (
             tts_busy.is_set()
             or is_recording.is_set()
@@ -3830,7 +3830,6 @@ def record_utterance(
     limit_s = float(VAD_MAX_SECONDS if max_seconds is None else max_seconds)
     max_frames = max(1, int(limit_s * 1000 / VAD_FRAME_MS))
     ignore_onset_frames = max(0, int(round(float(ignore_onset_ms) / VAD_FRAME_MS)))
-    barge_rms_floor = adaptive_barge_in_rms()
 
     try:
         reset_silero_states()
@@ -3853,12 +3852,10 @@ def record_utterance(
     t0 = time.perf_counter()
     # Streaming DC / rumble kill — state persists across frames for this utterance.
     dc_blocker = DcBlocker(r=DC_BLOCKER_R)
-    barge_need = max(1, int(round(BARGE_IN_MIN_SPEECH_MS / VAD_FRAME_MS)))
-    barge_frames = 0
 
     def consume_frame(frame_idx: int, samples_16k: np.ndarray) -> bool:
         """Return True when recording should stop."""
-        nonlocal speech_started, silence_frames, speech_frames, stop_reason, barge_frames
+        nonlocal speech_started, silence_frames, speech_frames, stop_reason
 
         # DC-block before Silero so offset cannot inflate probabilities.
         samples_16k = dc_blocker.apply(samples_16k)
@@ -3870,7 +3867,6 @@ def record_utterance(
         elif samples_16k.size > VAD_FRAME_SAMPLES:
             samples_16k = samples_16k[:VAD_FRAME_SAMPLES]
 
-        frame_rms = float(np.sqrt(np.mean(np.square(samples_16k))) + 1e-12)
         try:
             is_speech = bool(is_speech_frame(samples_16k, sample_rate=SAMPLE_RATE))
         except Exception as exc:  # noqa: BLE001
@@ -3882,41 +3878,8 @@ def record_utterance(
             if len(pre_roll) > VAD_PRE_ROLL_FRAMES:
                 pre_roll.pop(0)
 
-            # Barge-in: user talks over Donna → cut TTS and start capturing now.
-            # UI acknowledgments (Yes?, mode acks) are uninterruptible — ignore onset.
-            if (
-                tts_busy.is_set()
-                and get_ui_state() == "speaking"
-                and is_speech
-                and frame_rms >= barge_rms_floor
-            ):
-                if not _tts_barge.is_playback_interruptible():
-                    barge_frames = 0
-                    return False
-                barge_frames += 1
-                if barge_frames >= barge_need:
-                    from donna.audio.vad_consumer import trigger_tts_barge_in
-
-                    trigger_tts_barge_in(
-                        reason=(
-                            f"vad_onset rms={frame_rms:.4f} "
-                            f"gate={barge_rms_floor:.4f}"
-                        )
-                    )
-                    speech_started = True
-                    collected.extend(pre_roll)
-                    speech_frames = 1
-                    silence_frames = 0
-                    log(
-                        "BargeIn",
-                        f"VAD onset while speaking (rms={frame_rms:.4f}, "
-                        f"gate={barge_rms_floor:.4f}) — interrupting TTS",
-                    )
-                return False
-            barge_frames = 0
-
-            # Skip early false onsets (speaker bleed / buffer tail after TTS ack).
-            # Also ignore speech while wake-ack TTS is still playing (tts_busy).
+            # Half-duplex: never barge-in from VAD while TTS is playing — speaker
+            # echo must not cut Donna. Mic onset is ignored until playback ends.
             if tts_busy.is_set() or frame_idx < ignore_onset_frames:
                 return False
             if is_speech:
@@ -6057,55 +6020,16 @@ def _play_pcm_interruptible(
     return interrupted
 
 
-def barge_in_watch(stop_flag: threading.Event) -> None:
-    """Stream-barge listener while Piper TTS plays (queue consumer, no InputStream).
+def half_duplex_mic_drop(stop_flag: threading.Event) -> None:
+    """Half-duplex: discard mic frames while TTS plays (no barge-in evaluation).
 
-    Abort TTS when:
-      * wake-word ("Donna") scores above threshold, OR
-      * sustained Silero speech onset (classic barge-in).
-
-    Stands down when ``record_utterance`` already owns the mic queue, when the
-    active utterance is an uninterruptible UI acknowledgment, or during the
-    post-playback-onset grace window (speaker pop / room echo).
+    Speaker echo / room bleed must never call ``TtsWorker.interrupt()``. The
+    mic queue is flushed continuously until playback ends; wake-word and VAD
+    stand down on the same shared stream for the duration.
     """
     if vad_capture_active.is_set():
         return
-    if not _tts_barge.is_playback_interruptible():
-        return
-
-    grace_s = BARGE_IN_PLAYBACK_GRACE_MS / 1000.0
-    if grace_s > 0:
-        # Wait out TtsWorker playback-onset grace so speaker bleed cannot cut TTS.
-        while _tts_barge.in_playback_grace(grace_s=grace_s):
-            if (
-                stop_flag.is_set()
-                or stop_event.is_set()
-                or not tts_busy.is_set()
-                or vad_capture_active.is_set()
-                or not _tts_barge.is_playback_interruptible()
-            ):
-                return
-            time.sleep(0.02)
-
-    if vad_capture_active.is_set():
-        return
-    if not _tts_barge.is_playback_interruptible():
-        return
-
-    # Drop frames accumulated while wake-word was idle during TTS settle.
     flush_audio_buffer_queue()
-
-    from donna.audio.vad_consumer import reset_silero_states, speech_probability
-
-    try:
-        reset_silero_states()
-    except Exception:  # noqa: BLE001
-        pass
-    dc = DcBlocker(r=DC_BLOCKER_R)
-    oww = _shared_wakeword_model
-    wake_token = (_shared_wakeword_token or "donna").lower()
-
-    consec = 0
     try:
         while (
             not stop_flag.is_set()
@@ -6113,91 +6037,21 @@ def barge_in_watch(stop_flag: threading.Event) -> None:
             and tts_busy.is_set()
             and not vad_capture_active.is_set()
         ):
-            if get_ui_state() != "speaking":
-                consec = 0
-                time.sleep(0.01)
-                continue
-            # Re-check grace (covers begin_playback restart mid-watcher).
-            if _tts_barge.in_playback_grace(grace_s=grace_s):
-                consec = 0
-                time.sleep(0.01)
-                continue
-            samples = get_mic_frame(timeout=0.25)
-            if samples is None:
-                continue
-            samples = dc.apply(samples)
-            if samples.size < VAD_FRAME_SAMPLES:
-                pad = np.zeros(VAD_FRAME_SAMPLES, dtype=np.float32)
-                pad[: samples.size] = samples
-                samples = pad
-            else:
-                samples = samples[:VAD_FRAME_SAMPLES]
-
-            rms = float(np.sqrt(np.mean(np.square(samples))) + 1e-12)
-            pcm = np.clip(samples * 32767.0, -32768, 32767).astype(np.int16)
-
-            wake_hit = False
-            if oww is not None:
-                try:
-                    pred = oww.predict(pcm)
-                    pred_d = pred if isinstance(pred, dict) else {}
-                    for key, score in pred_d.items():
-                        try:
-                            value = float(score)
-                        except (TypeError, ValueError):
-                            continue
-                        if wake_token in str(key).lower() and value >= WAKE_THRESHOLD:
-                            wake_hit = True
-                            break
-                except Exception:
-                    wake_hit = False
-            if wake_hit:
-                log(
-                    "BargeIn",
-                    f"Wake-word stream-barge (rms={rms:.4f}) — interrupting TTS",
-                )
-                from donna.audio.vad_consumer import trigger_tts_barge_in
-
-                trigger_tts_barge_in(reason=f"wake_stream rms={rms:.4f}")
+            # Drain then discard — do not run Silero / wake scoring.
+            frame = get_mic_frame(timeout=0.05)
+            if frame is None:
                 flush_audio_buffer_queue()
-                return
-
-            # Silero-only speech barge-in (no raw RMS interrupt — avoids mic spikes).
-            try:
-                speech_prob = float(
-                    speech_probability(samples, sample_rate=SAMPLE_RATE)
-                )
-            except Exception:
-                speech_prob = 0.0
-            if speech_prob > BARGE_IN_SILERO_THRESHOLD:
-                consec += 1
-                if consec >= BARGE_IN_SILERO_CONSEC_FRAMES:
-                    log(
-                        "BargeIn",
-                        f"Speech onset while speaking "
-                        f"(silero_prob={speech_prob:.3f}, "
-                        f"thresh={BARGE_IN_SILERO_THRESHOLD}, "
-                        f"frames={consec}, rms={rms:.4f}) — interrupting TTS",
-                    )
-                    from donna.audio.vad_consumer import trigger_tts_barge_in
-
-                    trigger_tts_barge_in(
-                        reason=(
-                            f"speech_onset silero_prob={speech_prob:.3f} "
-                            f"thresh={BARGE_IN_SILERO_THRESHOLD} "
-                            f"frames={consec}"
-                        )
-                    )
-                    flush_audio_buffer_queue()
-                    return
-            else:
-                consec = 0
+                time.sleep(0.01)
+                continue
+            # Drop frame (half-duplex deaf period).
     except Exception as exc:  # noqa: BLE001
-        log_debug("BargeIn", f"watcher unavailable ({exc})")
+        log_debug("BargeIn", f"half-duplex mic drop unavailable ({exc})")
     finally:
-        # Leave a clean mic queue for the next consumer (VAD or wake standby).
-        if tts_interrupt_event.is_set() or not tts_busy.is_set():
-            flush_audio_buffer_queue()
+        flush_audio_buffer_queue()
+
+
+# Back-compat alias — former stream-barge watcher is now half-duplex only.
+barge_in_watch = half_duplex_mic_drop
 
 
 def _boost_audio_thread_priority() -> None:
@@ -6572,16 +6426,14 @@ def tts_worker() -> None:
             prev_ui = get_ui_state()
             set_ui_state("speaking")
             watcher_stop = threading.Event()
-            watcher: threading.Thread | None = None
-            # UI acknowledgments: no stream-barge watcher (prevents self-barge-in).
-            if item_interruptible:
-                watcher = threading.Thread(
-                    target=barge_in_watch,
-                    args=(watcher_stop,),
-                    name="BargeInWatch",
-                    daemon=True,
-                )
-                watcher.start()
+            # Half-duplex: always discard mic frames during TTS (acks + LLM speech).
+            watcher = threading.Thread(
+                target=half_duplex_mic_drop,
+                args=(watcher_stop,),
+                name="HalfDuplexMicDrop",
+                daemon=True,
+            )
+            watcher.start()
             interrupted = False
             turn_t0 = time.perf_counter()
             time.sleep(0.05)
